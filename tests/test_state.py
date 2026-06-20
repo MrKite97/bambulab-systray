@@ -52,7 +52,9 @@ def test_merge_advances_last_update_monotonic():
     s.merge({"mc_percent": 1})
     first = s.last_update_monotonic
     assert first > 0.0
-    time.sleep(0.01)
+    # Windows time.monotonic() resolution is ~15.6ms; sleep comfortably past it
+    # so the second merge lands on a strictly later tick.
+    time.sleep(0.05)
     s.merge({"mc_percent": 2})
     assert s.last_update_monotonic > first
 
