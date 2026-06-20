@@ -94,3 +94,22 @@ def pick_serial(devices: list[dict]) -> str:
     if not devices:
         raise ValueError("No bound devices on this account")
     return devices[0]["dev_id"]
+
+
+def mqtt_username_from_token(access_token: str) -> str:
+    """Derive the MQTT username from the access-token JWT (RESEARCH Pattern 3).
+
+    A JWT is ``header.payload.signature``; the payload's ``username`` claim is
+    the MQTT username, formatted ``u_<digits>``. We base64-decode segment[1]
+    only -- the header and signature are ignored, and the signature is NOT
+    verified (we only read a claim; the server enforces token validity, threat
+    T-01-06). stdlib ``base64`` + ``json`` only -- no PyJWT.
+
+    The base64 payload may lack ``=`` padding, so we re-pad to a multiple of 4
+    before decoding. The MQTT *password* is the raw ``access_token`` itself
+    (handled by the caller; never logged -- threat T-01-04).
+    """
+    payload_b64 = access_token.split(".")[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)  # fix base64 padding
+    payload = json.loads(base64.b64decode(payload_b64))
+    return payload["username"]  # e.g. "u_1234567890"
