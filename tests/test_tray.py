@@ -23,6 +23,7 @@ class FakeIcon:
     def __init__(self):
         self.icon = None
         self.title = None
+        self.visible = False
         self.icon_set_count = 0
         self.title_set_count = 0
 
@@ -176,3 +177,92 @@ def test_pump_coalesces_multiple_enqueued_requests():
 
     assert icon.icon_set_count == 1
     assert icon.title == "42% — nog 1u 30m"
+
+
+# --- Task 2: reassert hook + build_setup UI-thread pump --------------------
+
+
+def test_reassert_paints_even_when_key_unchanged():
+    """reassert() forces a repaint regardless of the debounce key -- used after
+    the tray icon is recreated (e.g. TaskbarCreated / Explorer restart)."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = tray.TrayController(icon, state)
+
+    ctrl.on_state_change()
+    ctrl.pump_once()  # paint #1, baseline now set
+    ctrl.reassert()  # same key, but reassert always repaints
+
+    assert icon.icon_set_count == 2
+    assert icon.title == "42% — nog 1u 23m"
+
+
+def test_reassert_resets_debounce_baseline():
+    """After reassert(), a following on_state_change with the SAME value does
+    NOT double-paint -- reassert resets the baseline to the current state."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = tray.TrayController(icon, state)
+
+    ctrl.reassert()  # paint #1, baseline = current (42, "1:23")
+    ctrl.on_state_change()  # identical value
+    ctrl.pump_once()  # must be a no-op
+
+    assert icon.icon_set_count == 1
+
+
+def test_reassert_from_cold_paints_once():
+    """reassert() works as the FIRST paint at startup (no prior pump)."""
+    icon = FakeIcon()
+    ctrl = tray.TrayController(icon, _active(42, 83))
+
+    ctrl.reassert()
+
+    assert icon.icon_set_count == 1
+    assert icon.title == "42% — nog 1u 23m"
+
+
+def test_build_setup_makes_visible_and_paints():
+    """build_setup() returns a UI-thread callback that makes the icon visible
+    and performs an initial reassert (so the icon shows immediately on launch)."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = tray.TrayController(icon, state)
+
+    setup = ctrl.build_setup()
+    setup(icon)
+
+    assert icon.visible is True
+    assert icon.icon_set_count == 1
+    assert icon.title == "42% — nog 1u 23m"
+
+
+def test_build_setup_no_double_paint_on_first_real_change():
+    """After build_setup()'s initial paint, the first on_state_change with the
+    same displayed value does NOT repaint (baseline was reset by reassert)."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = tray.TrayController(icon, state)
+
+    ctrl.build_setup()(icon)  # initial paint, baseline set
+    ctrl.on_state_change()  # same value
+    ctrl.pump_once()
+
+    assert icon.icon_set_count == 1
+
+
+def test_build_setup_tolerates_icon_without_visible_attr():
+    """build_setup() must not fail on an icon lacking a ``visible`` attribute;
+    it still performs the initial paint."""
+
+    class MinimalIcon:
+        def __init__(self):
+            self.icon = None
+            self.title = None
+
+    icon = MinimalIcon()
+    ctrl = tray.TrayController(icon, _active(42, 83))
+
+    ctrl.build_setup()(icon)  # must not raise
+
+    assert icon.title == "42% — nog 1u 23m"
