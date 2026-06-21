@@ -16,6 +16,10 @@ can ever reach the tooltip/icon, and nothing here logs.
 5-state machine (offline / disconnected / token-expired) is Phase 3.
 """
 
+import os
+
+from PIL import Image, ImageDraw, ImageFont
+
 from src.state import PrintState, hmm
 
 ACTIVE_STATES = {"RUNNING", "PAUSE"}
@@ -52,3 +56,47 @@ def tooltip_text(state: PrintState) -> str:
     if not is_active_print(state.gcode_state):
         return "Geen actieve print"
     return f"{state.mc_percent}% — {_dutch_duration(state.mc_remaining_time)}"
+
+
+# --- Pillow rendering ------------------------------------------------------
+# We render at 64x64 and let Windows downscale to the tray size (crisper than
+# drawing directly at 16x16). The font is bundled in assets/ so the frozen .exe
+# never depends on a system-installed font path.
+
+ICON_SIZE = 64
+_ICON_FONT_SIZE = 34
+_FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "DejaVuSans.ttf")
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    """Load the bundled DejaVuSans font (never a system font path)."""
+    return ImageFont.truetype(_FONT_PATH, size)
+
+
+def render_icon(text: str | None) -> Image.Image:
+    """Render a 64x64 RGBA tray icon.
+
+    ``text`` -> centered white time digits (active print).
+    ``None`` -> a neutral grey dot, no digits (no active print).
+    """
+    img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if text is None:
+        # Neutral idle glyph: a centered filled dot, no digits.
+        d.ellipse((22, 22, 42, 42), fill=(180, 180, 180, 255))
+        return img
+    font = _load_font(_ICON_FONT_SIZE)
+    bbox = d.textbbox((0, 0), text, font=font)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text(
+        ((ICON_SIZE - w) / 2 - bbox[0], (ICON_SIZE - h) / 2 - bbox[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+    )
+    return img
+
+
+def render_for_state(state: PrintState) -> Image.Image:
+    """Icon for a PrintState: time digits when active, neutral glyph when idle."""
+    return render_icon(icon_text(state))

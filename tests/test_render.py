@@ -5,9 +5,14 @@ tooltip) and the 64x64 RGBA icon image properties. No pystray, no network --
 rendering is verified by asserting on format strings and the produced PIL image.
 """
 
+import os
+
 from src.render import (
+    ICON_SIZE,
     icon_text,
     is_active_print,
+    render_for_state,
+    render_icon,
     tooltip_text,
 )
 from src.state import PrintState
@@ -85,3 +90,66 @@ def test_tooltip_text_idle_is_geen_actieve_print():
     """No active print -> tooltip is exactly 'Geen actieve print'."""
     assert tooltip_text(_state(gcode_state="IDLE")) == "Geen actieve print"
     assert tooltip_text(_state(gcode_state="FAILED")) == "Geen actieve print"
+
+
+# --- render_icon / render_for_state ---------------------------------------
+
+
+def _opaque_coords(img):
+    """Return the set of (x, y) coords whose alpha channel is fully opaque (255)."""
+    px = img.load()
+    w, h = img.size
+    return {(x, y) for x in range(w) for y in range(h) if px[x, y][3] == 255}
+
+
+def test_render_icon_is_64x64_rgba():
+    """render_icon returns a 64x64 RGBA PIL image."""
+    img = render_icon("1:23")
+    assert img.mode == "RGBA"
+    assert img.size == (ICON_SIZE, ICON_SIZE) == (64, 64)
+
+
+def test_render_icon_draws_centered_text():
+    """Active text is drawn: opaque pixels exist in the central 16..48 band."""
+    img = render_icon("1:23")
+    opaque = _opaque_coords(img)
+    assert opaque, "expected at least one fully-opaque pixel"
+    central = [c for c in opaque if 16 <= c[0] <= 48 and 16 <= c[1] <= 48]
+    assert central, "expected opaque pixels in the central region (text not centered)"
+
+
+def test_render_icon_longest_string_fits_64px():
+    """The widest expected strings ('12:34', '10u') stay within the 64px canvas."""
+    for text in ("12:34", "10u"):
+        img = render_icon(text)
+        bbox = img.getbbox()
+        assert bbox is not None
+        assert bbox[2] <= ICON_SIZE and bbox[3] <= ICON_SIZE, f"{text} overflows: {bbox}"
+
+
+def test_render_icon_idle_is_neutral_glyph():
+    """render_icon(None) is a 64x64 RGBA neutral icon with opaque pixels and no digits."""
+    img = render_icon(None)
+    assert img.mode == "RGBA"
+    assert img.size == (64, 64)
+    assert _opaque_coords(img), "neutral icon must have a visible (opaque) glyph"
+    # Differs from an active time icon (no digits drawn).
+    assert _opaque_coords(img) != _opaque_coords(render_icon("1:23"))
+
+
+def test_render_for_state_matches_icon_text():
+    """render_for_state(state) draws the same pixels as render_icon(icon_text(state))."""
+    active = _state(mc_percent=47, mc_remaining_time=83)
+    assert _opaque_coords(render_for_state(active)) == _opaque_coords(
+        render_icon(icon_text(active))
+    )
+    idle = _state(gcode_state="IDLE")
+    assert _opaque_coords(render_for_state(idle)) == _opaque_coords(render_icon(None))
+
+
+def test_bundled_font_exists():
+    """The bundled font ships in assets/ (no system font path dependency)."""
+    font_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "assets", "DejaVuSans.ttf"
+    )
+    assert os.path.exists(font_path)
