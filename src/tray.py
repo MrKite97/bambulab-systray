@@ -74,3 +74,44 @@ class TrayController:
         *what* to draw, so we read it fresh here (image first, then tooltip)."""
         self._icon.icon = render.render_for_state(self._state)
         self._icon.title = render.tooltip_text(self._state)
+
+    # --- TaskbarCreated / startup re-registration --------------------------
+    #
+    # TaskbarCreated handling decision: pystray's Windows backend listens for
+    # the broadcast ``TaskbarCreated`` message and re-adds its tray icon on its
+    # OWN UI thread after an Explorer restart -- but it re-adds a DEFAULT icon,
+    # losing our drawn bitmap/tooltip. We hook into that recreation by calling
+    # ``reassert()`` from the UI thread, which repaints our content from the
+    # current PrintState. We deliberately do NOT register an explicit win32
+    # ``TaskbarCreated`` listener yet: the default expectation is that pystray
+    # handles the re-add and we only need to repaint. If the Plan 03 human-verify
+    # shows the icon does NOT reappear after an Explorer restart, add an explicit
+    # listener then. (Real Explorer-restart survival is a Plan 03 human-verify
+    # item.)
+
+    def reassert(self):
+        """Repaint unconditionally and reset the debounce baseline.
+
+        Used (a) for the first paint at startup and (b) after the tray icon is
+        recreated following a ``TaskbarCreated`` (Explorer restart). Unlike
+        ``pump_once`` this ignores the debounce key, then re-baselines it to the
+        current state so the NEXT identical ``on_state_change`` does not
+        double-paint."""
+        self._apply()
+        self._last_key = self._key(self._state)
+
+    def build_setup(self):
+        """Return a pystray ``run(setup=...)`` callback. It runs ONCE on the UI
+        thread when the icon becomes visible: it makes the icon visible and
+        paints the first frame so the icon shows immediately on launch.
+
+        pystray itself re-creates the icon on ``TaskbarCreated``; the run loop
+        should call :meth:`reassert` after such a recreation to restore our
+        drawn content."""
+
+        def _setup(icon):
+            if hasattr(icon, "visible"):
+                icon.visible = True
+            self.reassert()
+
+        return _setup
