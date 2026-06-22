@@ -44,6 +44,7 @@ import pystray
 from src import (
     auth,
     autostart,
+    bridge,
     mqtt_client,
     render,
     settings as settings_module,
@@ -51,9 +52,10 @@ from src import (
     spike,
     token_store,
 )
+from src.flyout import FlyoutWindow
 from src.state import PrintState
 from src.status import ConnectionStatus
-from src.tray import TrayController
+from src.tray import TrayController, make_open_item
 
 logger = logging.getLogger("app")
 
@@ -184,18 +186,32 @@ def make_status_connect(controller, inner_connect, *, on_auth_fail):
     return _connect
 
 
-def make_quit_handler(client, shutdown_event):
-    """Build the 'Afsluiten' menu callback that tears down BOTH threads and
-    disposes the icon.
+def make_quit_handler(client, shutdown_event, *, flyout=None):
+    """Build the 'Afsluiten' menu callback that tears down the GUI + both threads.
 
-    The handler (1) sets the shutdown event so the network loop stops looping,
-    (2) disconnects the MQTT client -- which makes ``loop_forever()`` return so
-    ``run_session`` ends cleanly, and (3) calls ``icon.stop()`` to dispose the
-    tray icon and unblock ``icon.run()``. ``icon.stop()`` is called LAST and
-    unconditionally so NO orphaned tray icon is ever left behind (T-02-07).
+    CANONICAL ORDER (LOCKED, deadlock-safety -- 07-CONTEXT.md "Threading model"):
+    because ``webview.start()`` blocks the MAIN thread until every window is
+    destroyed, the flyout window MUST be destroyed FIRST -- otherwise the main
+    thread stays parked in ``webview.start()`` forever (deadlock) and the process
+    never exits. The exact sequence:
+
+      a. ``flyout.destroy()``    -- FIRST: unblocks the main thread's webview.start()
+      b. ``shutdown_event.set()``
+      c. ``client.disconnect()`` -- ends loop_forever -> run_session sees a clean end
+      d. ``icon.stop()``         -- disposes the tray icon (NO orphan)
+
+    Every teardown step is wrapped so the quit path NEVER raises and NEVER leaves
+    an orphan icon: ``icon.stop()`` is reached even if destroy/disconnect fail
+    (T-02-07 / T-07-06). ``flyout`` is optional so the v1 console/tray-only path
+    (no window) keeps working; when None the sequence is just b->c->d.
     """
 
     def _on_quit(icon, item):
+        if flyout is not None:
+            try:
+                flyout.destroy()  # FIRST: unblocks the main thread's webview.start()
+            except Exception:  # noqa: BLE001 - teardown must never block the rest
+                logger.debug("flyout.destroy() raised during quit; continuing")
         shutdown_event.set()
         try:
             client.disconnect()  # ends loop_forever -> run_session sees a clean end
@@ -313,6 +329,73 @@ def make_connect(shutdown_event):
     return _connect
 
 
+# --- Phase 7 flyout/bridge wiring (stubs for THIS phase) -------------------- #
+#
+# The bridge action handlers are deliberate STUBS this phase: a tray click must
+# open a themed panel and the JS<->Python round-trip must work, but real
+# auth/login (Phase 8) and live MQTT/control binding (Phase 9) are NOT wired
+# here (07-CONTEXT.md scope guard). Each stub logs ONLY the action NAME -- never
+# the email/password/code/command payload (T-07-02). serialize_state (Plan 02)
+# guarantees the pushed state carries no secret.
+
+# The page-action method names the panel can call (mirrors bridge._METHODS minus
+# hide / get_initial_state, which are wired to real callables below).
+_STUB_ACTIONS = (
+    "login_submit",
+    "submit_code",
+    "resend_code",
+    "select_printer",
+    "logout",
+    "control",
+)
+
+
+def _make_stub_action(name):
+    """Build a harmless page-action handler that logs only the action NAME.
+
+    Phases 8/9 replace these with the real auth/control handlers. The returned
+    callable accepts (and ignores) any args so the panel can pass a payload
+    (email/password/code/command) WITHOUT it ever being logged (T-07-02)."""
+
+    def _stub(*_args, **_kwargs):
+        # NEVER log *_args -- they may carry email/password/code/command values.
+        logger.debug("bridge action: %s", name)
+        return None
+
+    return _stub
+
+
+def make_bridge_handlers(flyout):
+    """Build the js_api handler mapping for THIS phase.
+
+    ``hide`` is wired to the real ``flyout.hide`` (click-away / tray toggle); the
+    auth/control actions are safe stubs (see :func:`_make_stub_action`) that log
+    only the action name. The mapping is the seam Phases 8/9 plug real handlers
+    into."""
+    handlers = {"hide": flyout.hide}
+    for name in _STUB_ACTIONS:
+        handlers[name] = _make_stub_action(name)
+    return handlers
+
+
+def make_flyout_toggle(flyout):
+    """Build the zero-arg tray LEFT-click toggle.
+
+    On the SHOW path it pushes the current Windows theme via
+    ``flyout.push_theme(detect_windows_theme())`` so the panel always opens themed
+    to the live light/dark setting (FLY-02), THEN toggles visibility. Hiding does
+    not need a theme push. ``flyout.visible`` distinguishes the two paths."""
+
+    def _toggle():
+        # If the window is currently hidden we are about to SHOW it -> push theme
+        # first so the panel renders in the right theme as it appears (FLY-02).
+        if not getattr(flyout, "visible", False):
+            flyout.push_theme(render.detect_windows_theme())
+        flyout.toggle()
+
+    return _toggle
+
+
 def build_app(
     token,
     *,
@@ -324,6 +407,7 @@ def build_app(
     password=None,
     autostart_mod=autostart,
     settings=settings_module,
+    webview=None,
 ):
     """Compose the whole app from an already-acquired ``token`` and return the
     wired pieces WITHOUT starting any thread or launching a real tray.
@@ -365,7 +449,39 @@ def build_app(
         username=username,
         access_token=token,
     )
-    quit_handler = make_quit_handler(client, shutdown_event)
+
+    # --- Phase 7: bridge Api + single hidden flyout window -------------------
+    # Build the flyout (hidden) and the js_api BEFORE the menu so the tray's
+    # hidden default LEFT-click item can toggle it. The Api's state_provider needs
+    # the controller (built after the icon), so it reads it via a late-bound
+    # holder filled once the controller exists -- avoiding a construction cycle.
+    _holder = {"controller": None}
+
+    def _state_provider():
+        ctrl = _holder["controller"]
+        connection = (
+            getattr(ctrl, "_status", ConnectionStatus.DISCONNECTED)
+            if ctrl is not None
+            else ConnectionStatus.DISCONNECTED
+        )
+        return bridge.serialize_state(
+            state,
+            connection,
+            logged_in=True,
+            theme=render.detect_windows_theme(),
+        )
+
+    flyout = FlyoutWindow(None, webview=webview)
+    api = bridge.Api(
+        handlers=make_bridge_handlers(flyout), state_provider=_state_provider
+    )
+    flyout._api = api  # the js_api the window is created with (create() reads it)
+    flyout.create()  # create the single hidden window (no-op start; just builds it)
+    flyout_toggle = make_flyout_toggle(flyout)
+
+    # Afsluiten destroys the window FIRST (unblocks webview.start on the main
+    # thread) THEN tears down network + tray -- the locked deadlock-safe order.
+    quit_handler = make_quit_handler(client, shutdown_event, flyout=flyout)
 
     # Default the re-login token source to a spike.get_access_token closure so the
     # menu/401 path drives a FRESH verifyCode login (console verifyCode prompt is
@@ -392,6 +508,9 @@ def build_app(
         # re-login item (REL-02), then Afsluiten. The autostart tick mirrors the
         # live HKCU\Run state via the checked= lambda.
         menu=pystray.Menu(
+            # Hidden default item: a LEFT-click toggles the flyout (FLY-01). It is
+            # visible=False so the right-click menu below is unchanged.
+            make_open_item(flyout_toggle),
             pystray.MenuItem(
                 AUTOSTART_LABEL,
                 make_autostart_toggle(autostart_mod),
@@ -410,6 +529,9 @@ def build_app(
 
     # Inject the monotonic clock so the freshness/offline watcher is driveable.
     controller = TrayController(icon, state, now=now)
+    # Late-bind the controller into the bridge's state_provider so get_initial_state
+    # reports the live connection status the moment the panel opens.
+    _holder["controller"] = controller
     # The re-login routine needs the controller to flag TOKEN_EXPIRED; wire it now
     # that the controller exists (the menu callback closes over this same object).
     relogin_handler.bind_controller(controller)
@@ -443,6 +565,11 @@ def build_app(
         "state": state,
         "network_runner": network_runner,
         "shutdown_event": shutdown_event,
+        # Phase 7 additions: the single hidden flyout, its js_api, and the bound
+        # tray LEFT-click toggle (main() runs webview.start() on this flyout).
+        "flyout": flyout,
+        "api": api,
+        "flyout_toggle": flyout_toggle,
     }
 
 
@@ -455,19 +582,33 @@ def _configure_logging(debug: bool) -> None:
     )
 
 
-def main(argv=None, *, guard=None) -> int:
+def _import_webview():
+    """Lazily import the real pywebview module.
+
+    Kept out of module import so ``import src.app`` needs no GUI backend (the test
+    suite stays importable headless). Only ``main()`` calls this, and only after
+    a successful login, so a missing backend never breaks importing the package."""
+    import webview
+
+    return webview
+
+
+def main(argv=None, *, guard=None, webview=None) -> int:
     """Prompt for credentials, acquire a token via the reused Phase 1 flow, then
-    run the tray until 'Afsluiten'.
+    run the v2 flyout shell until 'Afsluiten'.
 
     Before doing anything else a single-instance guard runs: if another instance
     already holds the named mutex, log one line and ``return 0`` cleanly WITHOUT
     touching the tray or MQTT (threat T-04-06). ``guard`` is injectable so tests
     drive the already-running path without a real OS mutex.
 
-    The network session runs on a daemon thread; pystray's ``icon.run`` blocks
-    the UI thread (the pump thread is started inside ``build_setup``). On
-    'Afsluiten' the icon stops, ``run`` returns, and we briefly join the network
-    thread. No secret is ever logged.
+    THREADING (v2, LOCKED -- 07-CONTEXT.md): the MQTT session runs on a daemon
+    thread; the pystray tray runs via ``icon.run_detached()`` on its OWN thread;
+    and the MAIN thread runs ``webview.start()`` (the GUI loop), which blocks
+    until the flyout is destroyed. 'Afsluiten' destroys the window FIRST so
+    ``webview.start()`` returns; we then signal shutdown, join the network thread,
+    and stop the tray icon -- no orphan icon. ``webview`` is injectable so tests
+    drive the whole loop with a FakeWebview (no real GUI). No secret is logged.
     """
     parser = argparse.ArgumentParser(description="Bambu Lab system-tray app.")
     parser.add_argument("--debug", action="store_true", help="enable DEBUG logging")
@@ -483,13 +624,15 @@ def main(argv=None, *, guard=None) -> int:
         logger.info("Bambu Lab systray draait al; deze tweede instantie wordt afgesloten.")
         return 0
 
-    logger.info("Bambu Lab systray -- starting. Right-click the tray icon -> Afsluiten to quit.")
+    logger.info("Bambu Lab systray -- starting. Left-click the tray icon to open; right-click -> Afsluiten to quit.")
 
     # Load persisted settings (region/serial) so a remembered serial is available;
     # defaults are used on a missing/corrupt file (no regression to the login flow).
     settings = settings_module.load_settings()
     logger.debug("Loaded settings (serial remembered: %s)", settings.get("serial") is not None)
 
+    # Console login fallback (kept from v1 until Phase 8 moves login into the
+    # panel). The credentials are held only in memory and never logged (T-02-06).
     email = input("Bambu account email: ").strip()
     # getpass: no echo, in-memory only, never persisted or logged (T-02-06).
     password = getpass.getpass("Bambu account password: ")
@@ -500,24 +643,39 @@ def main(argv=None, *, guard=None) -> int:
         logger.error("%s", exc)
         return 1
 
-    # Pass the credentials so the menu/401 re-login can drive a fresh login. They
-    # are held only in memory and never logged (T-03-06).
-    app = build_app(token, email=email, password=password)
-    icon = app["icon"]
-    controller = app["controller"]
+    # The real pywebview backend is imported lazily and only now (after login).
+    if webview is None:
+        webview = _import_webview()
+
+    # Pass the credentials so the menu/401 re-login can drive a fresh login, and
+    # the webview backend so the flyout window is created against the real GUI.
+    wired = build_app(token, email=email, password=password, webview=webview)
+    icon = wired["icon"]
+    controller = wired["controller"]
+    shutdown_event = wired["shutdown_event"]
 
     network_thread = threading.Thread(
-        target=app["network_runner"], name="mqtt-network", daemon=True
+        target=wired["network_runner"], name="mqtt-network", daemon=True
     )
     network_thread.start()
 
-    # icon.run blocks the UI thread until 'Afsluiten' calls icon.stop().
-    # make_setup paints the first frame AND starts the single UI pump thread.
-    icon.run(setup=make_setup(controller, app["shutdown_event"]))
+    # v2 threading inversion: the tray runs on its OWN thread (run_detached) so
+    # the MAIN thread is free to run webview.start(). make_setup paints the first
+    # frame AND starts the single UI pump thread when the icon becomes visible.
+    icon.run_detached(setup=make_setup(controller, shutdown_event))
 
-    # 'Afsluiten' was clicked: the shutdown event is set and disconnect requested.
-    app["shutdown_event"].set()
+    # The MAIN thread now enters the GUI loop and blocks until the flyout window
+    # is destroyed (the Afsluiten handler calls flyout.destroy() FIRST).
+    webview.start()
+
+    # webview.start() returned -> the window was destroyed (Afsluiten). Tear down
+    # the rest defensively so a teardown error never leaves an orphan tray icon.
+    shutdown_event.set()
     network_thread.join(timeout=5)
+    try:
+        icon.stop()  # idempotent: if Afsluiten already stopped it this is a no-op
+    except Exception:  # noqa: BLE001 - never raise out of the clean-exit path
+        logger.debug("icon.stop() raised during final teardown; ignoring")
     logger.info("Stopped.")
     return 0
 

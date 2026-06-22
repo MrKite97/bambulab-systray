@@ -37,16 +37,26 @@ class CallRecorder:
 
 
 class FakeIcon:
-    """Stand-in for a pystray Icon: records icon/title assignments and stop()."""
+    """Stand-in for a pystray Icon: records icon/title assignments, stop(), and
+    the v2 run_detached(setup=...) call (so main()'s threading inversion is
+    verifiable without a real tray)."""
 
     def __init__(self):
         self.icon = None
         self.title = None
         self.visible = False
         self.stop_count = 0
+        self.run_detached_calls = 0
+        self.run_count = 0
 
     def stop(self):
         self.stop_count += 1
+
+    def run(self, setup=None):
+        self.run_count += 1
+
+    def run_detached(self, setup=None):
+        self.run_detached_calls += 1
 
 
 class FakeClient:
@@ -91,6 +101,57 @@ class FakeMsg:
 
     def __init__(self, payload):
         self.payload = payload
+
+
+class FakeWindow:
+    """Stand-in for a pywebview window: records show/hide/move/destroy and the
+    evaluate_js calls (so theme/state pushes can be inspected) -- no real GUI."""
+
+    def __init__(self):
+        self.shown = 0
+        self.hidden = 0
+        self.destroyed = 0
+        self.moves = []
+        self.evaluated = []
+
+    def show(self):
+        self.shown += 1
+
+    def hide(self):
+        self.hidden += 1
+
+    def move(self, x, y):
+        self.moves.append((x, y))
+
+    def destroy(self):
+        self.destroyed += 1
+
+    def evaluate_js(self, code):
+        self.evaluated.append(code)
+
+
+class FakeWebview:
+    """Stand-in for the pywebview module injected into build_app/main.
+
+    ``create_window`` returns a FakeWindow (recorded) and ``start`` is a no-op
+    that records the call -- so the whole flyout/threading wiring is verified
+    with NO real GUI backend."""
+
+    def __init__(self):
+        self.windows = []
+        self.created = []
+        self.start_calls = 0
+
+    def create_window(self, title, **kwargs):
+        win = FakeWindow()
+        win.title = title
+        win.kwargs = kwargs
+        self.windows.append(win)
+        self.created.append((title, kwargs))
+        return win
+
+    def start(self, *args, **kwargs):
+        self.start_calls += 1
 
 
 # --- Menu label -------------------------------------------------------------
@@ -192,9 +253,25 @@ def _patch_build_app(monkeypatch):
     """Monkeypatch auth.* + pystray so build_app runs with no network/tray.
 
     Returns a shared dict capturing the constructed FakeIcon and the menu items
-    so tests can inspect the wiring.
+    so tests can inspect the wiring. A FakeWebview is injected as the default
+    ``webview=`` of build_app so flyout.create() builds a FakeWindow (NO real GUI
+    backend is ever imported); it is exposed as ``captured["webview"]``.
     """
     captured = {"menu_items": [], "icon_obj": None}
+
+    # Inject a FakeWebview into every build_app call (so flyout.create() makes a
+    # FakeWindow, never importing the real pywebview). Wrap build_app so tests
+    # that don't pass webview= still run fully headless; an explicit webview=
+    # still wins.
+    _fake_webview = FakeWebview()
+    captured["webview"] = _fake_webview
+    _real_build_app = app.build_app
+
+    def _build_app(token, **kwargs):
+        kwargs.setdefault("webview", _fake_webview)
+        return _real_build_app(token, **kwargs)
+
+    monkeypatch.setattr(app, "build_app", _build_app)
 
     monkeypatch.setattr(app.auth, "mqtt_username_from_token", lambda t: "u_1")
     monkeypatch.setattr(app.auth, "get_device_list", lambda t: [{"dev_id": "SER"}])
@@ -217,12 +294,23 @@ def _patch_build_app(monkeypatch):
 
     # Fake pystray Icon/Menu/MenuItem so no real tray is constructed.
     class FakeMenuItem:
-        def __init__(self, text, action, checked=None):
+        def __init__(self, text, action, checked=None, default=False, visible=True):
             self.text = text
             self.action = action
             self.checked = checked
-            captured["menu_items"].append((text, action))
+            self.default = default
+            self.visible = visible
+            # Only record VISIBLE items in menu_items so the existing label
+            # assertions (autostart / re-login / Afsluiten) ignore the hidden
+            # default left-click 'Open' item.
+            if visible:
+                captured["menu_items"].append((text, action))
             captured.setdefault("menu_objs", []).append(self)
+
+        def __call__(self, icon):
+            # Mirror pystray: invoking a selected item forwards to the action as
+            # action(icon, item). Used by the flyout-toggle wiring test.
+            return self.action(icon, self)
 
     def fake_menu(*items):
         return list(items)
@@ -658,3 +746,216 @@ def test_main_exits_cleanly_when_already_running(monkeypatch, capsys):
 
     assert rc == 0
     assert built == []  # the app was never built; no tray/MQTT touched
+
+
+# --- Plan 07-03: v2 flyout/bridge wiring + threading inversion ---------------
+
+
+class RecordingFlyout:
+    """Stand-in for FlyoutWindow recording the call ORDER of every method so the
+    destroy-FIRST quit ordering and the show-path theme push are assertable."""
+
+    def __init__(self):
+        self.events = []
+        self.visible = False
+
+    def hide(self):
+        self.events.append("hide")
+        self.visible = False
+
+    def show(self):
+        self.events.append("show")
+        self.visible = True
+
+    def toggle(self):
+        self.events.append("toggle")
+        self.visible = not self.visible
+
+    def destroy(self):
+        self.events.append("destroy")
+
+    def push_theme(self, theme):
+        self.events.append(("push_theme", theme))
+
+
+def test_quit_handler_destroys_flyout_before_icon_stop():
+    """The Afsluiten handler destroys the flyout BEFORE icon.stop() -- the locked
+    deadlock-safe order (webview.start() must return before the tray is torn
+    down)."""
+    order = []
+
+    class OrderIcon(FakeIcon):
+        def stop(self):
+            order.append("icon.stop")
+            super().stop()
+
+    class OrderFlyout(RecordingFlyout):
+        def destroy(self):
+            order.append("flyout.destroy")
+            super().destroy()
+
+    client = FakeClient()
+    event = threading.Event()
+    flyout = OrderFlyout()
+    icon = OrderIcon()
+
+    handler = app.make_quit_handler(client, event, flyout=flyout)
+    handler(icon, item=None)
+
+    assert order.index("flyout.destroy") < order.index("icon.stop")
+    assert event.is_set()
+    assert client.disconnect_count == 1
+    assert icon.stop_count == 1
+
+
+def test_quit_handler_stops_icon_even_if_flyout_destroy_raises():
+    """A destroy() failure must NOT prevent icon.stop() (no orphan; T-07-06)."""
+
+    class RaisingFlyout(RecordingFlyout):
+        def destroy(self):
+            raise RuntimeError("window already gone")
+
+    event = threading.Event()
+    icon = FakeIcon()
+
+    handler = app.make_quit_handler(FakeClient(), event, flyout=RaisingFlyout())
+    handler(icon, item=None)
+
+    assert icon.stop_count == 1  # icon still disposed despite a destroy error
+
+
+def test_flyout_toggle_pushes_theme_on_show_only(monkeypatch):
+    """make_flyout_toggle pushes the live theme on the SHOW path (FLY-02) and
+    then toggles; hiding pushes no theme."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    flyout = RecordingFlyout()
+    toggle = app.make_flyout_toggle(flyout)
+
+    toggle()  # hidden -> show: pushes theme THEN toggles
+    assert flyout.events == [("push_theme", "dark"), "toggle"]
+
+    flyout.events.clear()
+    toggle()  # now visible -> hide: no theme push
+    assert flyout.events == ["toggle"]
+
+
+def test_build_app_wires_flyout_bridge_and_toggle(monkeypatch):
+    """build_app exposes a flyout + Api + bound toggle; the Api's hide handler
+    calls flyout.hide and the toggle calls flyout.toggle (all via the FakeWebview
+    -- no real GUI)."""
+    _patch_build_app(monkeypatch)
+
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+
+    assert result["flyout"] is not None
+    assert result["api"] is not None
+    assert callable(result["flyout_toggle"])
+
+    # The Api.hide action forwards to the real flyout.hide (the window is a
+    # FakeWindow built by the injected FakeWebview).
+    result["api"].hide()
+    assert result["flyout"].visible is False
+    # get_initial_state returns a non-secret state dict seeded from live state.
+    initial = result["api"].get_initial_state()
+    assert isinstance(initial, dict)
+    assert "loggedIn" in initial and "theme" in initial
+
+
+def test_build_app_creates_one_hidden_flyout_window(monkeypatch):
+    """build_app creates exactly ONE hidden frameless window via webview."""
+    captured = _patch_build_app(monkeypatch)
+
+    app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+
+    fake_webview = captured["webview"]
+    assert len(fake_webview.created) == 1
+    _title, kwargs = fake_webview.created[0]
+    assert kwargs.get("hidden") is True
+    assert kwargs.get("frameless") is True
+
+
+def test_get_initial_state_contains_no_secret(monkeypatch):
+    """The bridge state pushed to the page never carries a token/password/email
+    (T-07-02)."""
+    _patch_build_app(monkeypatch)
+    token = "HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SUPERSECRETSIG"
+
+    result = app.build_app(token, email="user@example.com", password="hunter2")
+    initial = result["api"].get_initial_state()
+
+    blob = json.dumps(initial)
+    assert "SUPERSECRETSIG" not in blob
+    assert token not in blob
+    assert "hunter2" not in blob
+    assert "user@example.com" not in blob
+
+
+def test_stub_action_logs_only_name_not_payload(monkeypatch, caplog):
+    """A stub page-action handler logs ONLY the action name, never the payload
+    (no email/password/code/command value reaches the logs -- T-07-02)."""
+    import logging
+
+    _patch_build_app(monkeypatch)
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+    api = result["api"]
+
+    with caplog.at_level(logging.DEBUG, logger="app"):
+        api.login_submit("secret@example.com", "hunter2")
+        api.submit_code("123456")
+        api.control("pause")
+
+    assert "login_submit" in caplog.text  # the action NAME is logged
+    # ...but none of the sensitive payload values are.
+    assert "secret@example.com" not in caplog.text
+    assert "hunter2" not in caplog.text
+    assert "123456" not in caplog.text
+    assert "pause" not in caplog.text
+
+
+def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
+    """main() runs the tray via run_detached (NOT on the main thread) and calls
+    webview.start() on the main thread -- the v2 threading inversion, driven end
+    to end with fakes (no real GUI/broker/login)."""
+
+    class OkGuard:
+        def acquire(self):
+            return True
+
+    fake_icon = FakeIcon()
+    fake_webview = FakeWebview()
+    flyout = RecordingFlyout()
+    started_threads = []
+
+    # Stub the whole login + build so no real network/stdin/tray is touched.
+    monkeypatch.setattr("builtins.input", lambda *a: "user@example.com")
+    monkeypatch.setattr(app.getpass, "getpass", lambda *a: "pw")
+    monkeypatch.setattr(app.spike, "get_access_token", lambda e, p: "TOKEN")
+    monkeypatch.setattr(app.settings_module, "load_settings", lambda: {"region": "global", "serial": None})
+
+    def fake_build_app(token, *, email=None, password=None, webview=None):
+        # main() must pass the injected webview through to build_app.
+        assert webview is fake_webview
+        return {
+            "icon": fake_icon,
+            "controller": object(),
+            "client": FakeClient(),
+            "state": PrintState(),
+            "network_runner": lambda: None,
+            "shutdown_event": threading.Event(),
+            "flyout": flyout,
+            "api": object(),
+            "flyout_toggle": lambda: None,
+        }
+
+    monkeypatch.setattr(app, "build_app", fake_build_app)
+    # make_setup is exercised elsewhere; neutralize it so run_detached gets a noop.
+    monkeypatch.setattr(app, "make_setup", lambda *a, **k: (lambda icon: None))
+
+    rc = app.main(argv=[], guard=OkGuard(), webview=fake_webview)
+
+    assert rc == 0
+    # Tray ran DETACHED (its own thread), never on the main thread via icon.run().
+    assert fake_icon.run_detached_calls == 1
+    assert fake_icon.run_count == 0
+    # The MAIN thread entered the GUI loop.
+    assert fake_webview.start_calls == 1
