@@ -41,7 +41,16 @@ from uuid import uuid4
 
 import pystray
 
-from src import auth, mqtt_client, render, spike, token_store
+from src import (
+    auth,
+    autostart,
+    mqtt_client,
+    render,
+    settings as settings_module,
+    single_instance,
+    spike,
+    token_store,
+)
 from src.state import PrintState
 from src.status import ConnectionStatus
 from src.tray import TrayController
@@ -55,6 +64,45 @@ QUIT_LABEL = "Afsluiten"
 # The "Opnieuw verbinden / inloggen" menu label (LOCKED by 03-CONTEXT.md). It
 # sits ALONGSIDE 'Afsluiten' and drives a fresh verifyCode login (REL-02).
 RELOGIN_LABEL = "Opnieuw verbinden / inloggen"
+
+# The checkable autostart toggle label (APP-02). The item's check state reflects
+# the current HKCU\Run registration; clicking it flips it on/off.
+AUTOSTART_LABEL = "Met Windows opstarten"
+
+
+def make_autostart_toggle(autostart_mod=None):
+    """Build the 'Met Windows opstarten' click handler.
+
+    On click: if autostart is currently enabled -> disable it, else enable it,
+    via the real ``autostart`` module (``autostart.is_enabled`` /
+    ``autostart.enable`` / ``autostart.disable`` against the HKCU\\Run key).
+    ``autostart_mod`` is injectable so tests drive the toggle with a fake module
+    (no real registry write); the menu item's ``checked=`` lambda separately reads
+    the same module's ``is_enabled()`` so the tick mirrors the live Run-key state.
+    """
+    mod = autostart_mod if autostart_mod is not None else autostart
+
+    def _toggle(icon=None, item=None):
+        # Toggle the HKCU\Run registration: autostart.is_enabled ->
+        # autostart.disable / autostart.enable (mod is the real module by default,
+        # a fake under test).
+        if mod.is_enabled():
+            mod.disable()
+        else:
+            mod.enable()
+
+    return _toggle
+
+
+def persist_serial(serial, *, settings=settings_module):
+    """Persist the picked printer ``serial`` to the settings JSON.
+
+    Loads current settings (region/serial) and overlays ONLY the serial, so the
+    remembered region is preserved. ``save_settings`` writes an allowlist
+    (region/serial) -- the token is structurally never written here (T-04-01). The
+    serial is benign and not logged. ``settings`` is injectable for tests.
+    """
+    settings.save_settings({**settings.load_settings(), "serial": serial})
 
 
 def make_on_message(controller):
@@ -274,6 +322,8 @@ def build_app(
     get_token=None,
     email=None,
     password=None,
+    autostart_mod=autostart,
+    settings=settings_module,
 ):
     """Compose the whole app from an already-acquired ``token`` and return the
     wired pieces WITHOUT starting any thread or launching a real tray.
@@ -298,6 +348,11 @@ def build_app(
     devices = auth.get_device_list(token)
     serial = auth.pick_serial(devices)
     logger.info("Using printer serial (dev_id): %s", serial)
+
+    # Remember the picked serial across restarts (APP-03). save_settings writes an
+    # allowlist (region/serial) so the token is structurally never persisted here
+    # (T-04-01); the existing region is preserved by loading first.
+    persist_serial(serial, settings=settings)
 
     # Single source of truth shared across the network and UI threads.
     state = PrintState()
@@ -333,8 +388,21 @@ def build_app(
         "bambu-systray",
         icon=render.render_icon(None),  # neutral icon until the first report
         title=render.tooltip_text(state),  # "Geen actieve print"
-        # Re-login item sits ALONGSIDE Afsluiten (REL-02). Order: reconnect first.
+        # Items, in order: the checkable autostart toggle (APP-02), then the
+        # re-login item (REL-02), then Afsluiten. The autostart tick mirrors the
+        # live HKCU\Run state via the checked= lambda.
         menu=pystray.Menu(
+            pystray.MenuItem(
+                AUTOSTART_LABEL,
+                make_autostart_toggle(autostart_mod),
+                # The tick reflects the live HKCU\Run state. Default reads the real
+                # autostart.is_enabled(); a fake module is honored under test.
+                checked=lambda item: (
+                    autostart.is_enabled()
+                    if autostart_mod is autostart
+                    else autostart_mod.is_enabled()
+                ),
+            ),
             pystray.MenuItem(RELOGIN_LABEL, relogin_handler),
             pystray.MenuItem(QUIT_LABEL, quit_handler),
         ),
@@ -387,9 +455,14 @@ def _configure_logging(debug: bool) -> None:
     )
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, guard=None) -> int:
     """Prompt for credentials, acquire a token via the reused Phase 1 flow, then
     run the tray until 'Afsluiten'.
+
+    Before doing anything else a single-instance guard runs: if another instance
+    already holds the named mutex, log one line and ``return 0`` cleanly WITHOUT
+    touching the tray or MQTT (threat T-04-06). ``guard`` is injectable so tests
+    drive the already-running path without a real OS mutex.
 
     The network session runs on a daemon thread; pystray's ``icon.run`` blocks
     the UI thread (the pump thread is started inside ``build_setup``). On
@@ -401,7 +474,22 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     _configure_logging(args.debug)
 
+    # Single-instance guard FIRST: a second launch exits cleanly without
+    # disturbing the running one (no tray, no MQTT). Fails open if the OS call
+    # itself errors, so the guard can never block a legitimate first launch.
+    if guard is None:
+        guard = single_instance.InstanceGuard()
+    if not guard.acquire():
+        logger.info("Bambu Lab systray draait al; deze tweede instantie wordt afgesloten.")
+        return 0
+
     logger.info("Bambu Lab systray -- starting. Right-click the tray icon -> Afsluiten to quit.")
+
+    # Load persisted settings (region/serial) so a remembered serial is available;
+    # defaults are used on a missing/corrupt file (no regression to the login flow).
+    settings = settings_module.load_settings()
+    logger.debug("Loaded settings (serial remembered: %s)", settings.get("serial") is not None)
+
     email = input("Bambu account email: ").strip()
     # getpass: no echo, in-memory only, never persisted or logged (T-02-06).
     password = getpass.getpass("Bambu account password: ")

@@ -199,6 +199,14 @@ def _patch_build_app(monkeypatch):
     monkeypatch.setattr(app.auth, "mqtt_username_from_token", lambda t: "u_1")
     monkeypatch.setattr(app.auth, "get_device_list", lambda t: [{"dev_id": "SER"}])
     monkeypatch.setattr(app.auth, "pick_serial", lambda devs: "SER")
+    # Never touch the real settings JSON / registry from build_app: stub the
+    # module-level settings + autostart so persist_serial and the checkable item
+    # run against in-memory fakes.
+    monkeypatch.setattr(app.settings_module, "load_settings", lambda: {"region": "global", "serial": None})
+    monkeypatch.setattr(app.settings_module, "save_settings", lambda s: None)
+    monkeypatch.setattr(app.autostart, "is_enabled", lambda: False)
+    monkeypatch.setattr(app.autostart, "enable", lambda: None)
+    monkeypatch.setattr(app.autostart, "disable", lambda: None)
     monkeypatch.setattr(
         app.mqtt_client,
         "build_client",
@@ -209,10 +217,12 @@ def _patch_build_app(monkeypatch):
 
     # Fake pystray Icon/Menu/MenuItem so no real tray is constructed.
     class FakeMenuItem:
-        def __init__(self, text, action):
+        def __init__(self, text, action, checked=None):
             self.text = text
             self.action = action
+            self.checked = checked
             captured["menu_items"].append((text, action))
+            captured.setdefault("menu_objs", []).append(self)
 
     def fake_menu(*items):
         return list(items)
@@ -511,3 +521,140 @@ def test_401_and_menu_share_relogin(monkeypatch):
     assert calls and calls[0] is True
     # The auto-401 path flagged TOKEN_EXPIRED on the same controller the menu uses.
     assert result["controller"]._status is ConnectionStatus.TOKEN_EXPIRED
+
+
+# --- Autostart toggle ("Met Windows opstarten") -----------------------------
+
+
+class FakeAutostart:
+    """In-memory stand-in for the autostart module: tracks the on/off state and
+    records enable()/disable() calls (no real registry write)."""
+
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+        self.enable_calls = 0
+        self.disable_calls = 0
+
+    def is_enabled(self):
+        return self.enabled
+
+    def enable(self):
+        self.enable_calls += 1
+        self.enabled = True
+
+    def disable(self):
+        self.disable_calls += 1
+        self.enabled = False
+
+
+def test_autostart_label_is_locked():
+    assert app.AUTOSTART_LABEL == "Met Windows opstarten"
+
+
+def test_autostart_toggle_enables_when_disabled():
+    fake = FakeAutostart(enabled=False)
+    toggle = app.make_autostart_toggle(fake)
+    toggle(icon=None, item=None)
+    assert fake.enable_calls == 1
+    assert fake.disable_calls == 0
+    assert fake.enabled is True
+
+
+def test_autostart_toggle_disables_when_enabled():
+    fake = FakeAutostart(enabled=True)
+    toggle = app.make_autostart_toggle(fake)
+    toggle(icon=None, item=None)
+    assert fake.disable_calls == 1
+    assert fake.enable_calls == 0
+    assert fake.enabled is False
+
+
+def test_menu_has_checkable_autostart_item_reflecting_state(monkeypatch):
+    """build_app adds a 'Met Windows opstarten' item whose checked= lambda reads
+    the injected autostart module's is_enabled()."""
+    captured = _patch_build_app(monkeypatch)
+    fake = FakeAutostart(enabled=True)
+
+    app.build_app(
+        "HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG", autostart_mod=fake
+    )
+
+    labels = [text for text, _ in captured["menu_items"]]
+    assert app.AUTOSTART_LABEL in labels
+
+    autostart_item = next(
+        m for m in captured["menu_objs"] if m.text == app.AUTOSTART_LABEL
+    )
+    # The check state mirrors the live autostart state.
+    assert autostart_item.checked is not None
+    assert autostart_item.checked(autostart_item) is True
+    fake.enabled = False
+    assert autostart_item.checked(autostart_item) is False
+
+    # Clicking the item flips the state through the injected module.
+    autostart_item.action(icon=None, item=autostart_item)
+    assert fake.enabled is True  # was False -> enable() ran
+
+
+# --- Serial persistence -----------------------------------------------------
+
+
+def test_persist_serial_saves_only_serial_no_token():
+    """persist_serial writes the picked serial via settings, preserving region,
+    and never includes a token key."""
+    saved = {}
+
+    class FakeSettings:
+        @staticmethod
+        def load_settings():
+            return {"region": "eu", "serial": None}
+
+        @staticmethod
+        def save_settings(s):
+            saved.update(s)
+
+    app.persist_serial("SER123", settings=FakeSettings)
+
+    assert saved["serial"] == "SER123"
+    assert saved["region"] == "eu"  # existing region preserved
+    assert "access_token" not in saved
+    assert "token" not in saved
+    assert "password" not in saved
+
+
+def test_build_app_persists_picked_serial(monkeypatch):
+    """build_app persists the serial chosen by pick_serial via settings (no token
+    key in the saved payload)."""
+    _patch_build_app(monkeypatch)
+    saved = {}
+    monkeypatch.setattr(
+        app.settings_module, "load_settings", lambda: {"region": "global", "serial": None}
+    )
+    monkeypatch.setattr(app.settings_module, "save_settings", lambda s: saved.update(s))
+
+    app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+
+    assert saved.get("serial") == "SER"  # the pick_serial value from the fake
+    assert "access_token" not in saved and "token" not in saved
+
+
+# --- Single-instance guard in main() ----------------------------------------
+
+
+def test_main_exits_cleanly_when_already_running(monkeypatch, capsys):
+    """If the single-instance guard reports another instance, main() returns 0
+    WITHOUT building the app or prompting for credentials (T-04-06)."""
+
+    class AlreadyRunningGuard:
+        def acquire(self):
+            return False  # another instance owns the mutex
+
+    built = []
+    monkeypatch.setattr(app, "build_app", lambda *a, **k: built.append(True))
+    # input() / getpass must never be reached on the already-running path.
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("prompted")))
+
+    rc = app.main(argv=[], guard=AlreadyRunningGuard())
+
+    assert rc == 0
+    assert built == []  # the app was never built; no tray/MQTT touched
