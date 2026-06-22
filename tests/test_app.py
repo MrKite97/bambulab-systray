@@ -941,10 +941,44 @@ def test_login_submit_handler_forwards_to_session(monkeypatch):
     assert login_calls == [("me@example.com", "pw")]
 
 
+class _BootstrapSession:
+    """A FakeSession that also records bootstrap_from_stored + show_login, used by
+    the main()/bootstrap tests. ``bootstrap_result`` decides logged-in vs login."""
+
+    def __init__(self, bootstrap_result=False):
+        self.calls = []
+        self.bootstrap_result = bootstrap_result
+
+    def bootstrap_from_stored(self):
+        self.calls.append("bootstrap_from_stored")
+        return self.bootstrap_result
+
+    def logout(self):
+        self.calls.append("logout")
+
+
+def _fake_gui(*, icon, flyout, session, controller=None):
+    """Build the dict build_gui returns, for stubbing it in main() tests."""
+    return {
+        "icon": icon,
+        "controller": controller if controller is not None else object(),
+        "state": PrintState(),
+        "shutdown_event": threading.Event(),
+        "flyout": flyout,
+        "api": object(),
+        "flyout_toggle": lambda: None,
+        "session": session,
+        "start_mqtt": (lambda token, serial: None),
+        "stop_session": (lambda: None),
+        "relogin_handler": object(),
+    }
+
+
 def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
     """main() runs the tray via run_detached (NOT on the main thread) and calls
     webview.start() on the main thread -- the v2 threading inversion, driven end
-    to end with fakes (no real GUI/broker/login)."""
+    to end with fakes (no real GUI/broker/login). Plan 08-02: main() builds the
+    token-less GUI via build_gui (NO console login) and bootstraps from stored."""
 
     class OkGuard:
         def acquire(self):
@@ -953,30 +987,18 @@ def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
     fake_icon = FakeIcon()
     fake_webview = FakeWebview()
     flyout = RecordingFlyout()
-    started_threads = []
+    session = _BootstrapSession(bootstrap_result=False)
 
-    # Stub the whole login + build so no real network/stdin/tray is touched.
-    monkeypatch.setattr("builtins.input", lambda *a: "user@example.com")
-    monkeypatch.setattr(app.getpass, "getpass", lambda *a: "pw")
-    monkeypatch.setattr(app.spike, "get_access_token", lambda e, p: "TOKEN")
-    monkeypatch.setattr(app.settings_module, "load_settings", lambda: {"region": "global", "serial": None})
+    monkeypatch.setattr(
+        app.settings_module, "load_settings", lambda: {"region": "global", "serial": None}
+    )
 
-    def fake_build_app(token, *, email=None, password=None, webview=None):
-        # main() must pass the injected webview through to build_app.
+    def fake_build_gui(*, webview=None, **kwargs):
+        # main() must pass the injected webview through to build_gui.
         assert webview is fake_webview
-        return {
-            "icon": fake_icon,
-            "controller": object(),
-            "client": FakeClient(),
-            "state": PrintState(),
-            "network_runner": lambda: None,
-            "shutdown_event": threading.Event(),
-            "flyout": flyout,
-            "api": object(),
-            "flyout_toggle": lambda: None,
-        }
+        return _fake_gui(icon=fake_icon, flyout=flyout, session=session)
 
-    monkeypatch.setattr(app, "build_app", fake_build_app)
+    monkeypatch.setattr(app, "build_gui", fake_build_gui)
     # make_setup is exercised elsewhere; neutralize it so run_detached gets a noop.
     monkeypatch.setattr(app, "make_setup", lambda *a, **k: (lambda icon: None))
 
@@ -988,6 +1010,83 @@ def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
     assert fake_icon.run_count == 0
     # The MAIN thread entered the GUI loop.
     assert fake_webview.start_calls == 1
+    # main() bootstrapped from the stored token instead of prompting the console.
+    assert "bootstrap_from_stored" in session.calls
+
+
+def test_main_has_no_console_login():
+    """app.main's source contains NO console-login call: no input(...) and no
+    getpass(...) for credentials (T-08-06 -- enforced via inspect.getsource)."""
+    import inspect
+
+    src = inspect.getsource(app.main)
+    assert "input(" not in src
+    assert "getpass" not in src
+
+
+def test_main_logged_out_start_sets_neutral_glyph_and_shows_flyout(monkeypatch):
+    """With no stored token, bootstrap returns False; main() leaves the LOGGED-OUT
+    neutral glyph (render_icon(None)) on the icon and SHOWS the flyout so the user
+    can log in via the panel."""
+
+    class OkGuard:
+        def acquire(self):
+            return True
+
+    fake_icon = FakeIcon()
+    fake_webview = FakeWebview()
+    flyout = RecordingFlyout()
+    session = _BootstrapSession(bootstrap_result=False)
+
+    neutral = object()
+    monkeypatch.setattr(app.render, "render_icon", lambda v: neutral)
+    monkeypatch.setattr(
+        app.settings_module, "load_settings", lambda: {"region": "global", "serial": None}
+    )
+    monkeypatch.setattr(app, "build_gui", lambda **k: _fake_gui(icon=fake_icon, flyout=flyout, session=session))
+    monkeypatch.setattr(app, "make_setup", lambda *a, **k: (lambda icon: None))
+
+    rc = app.main(argv=[], guard=OkGuard(), webview=fake_webview)
+
+    assert rc == 0
+    # The icon shows the neutral logged-out glyph (render_icon(None)).
+    assert fake_icon.icon is neutral
+    # The flyout was shown so the login screen is visible.
+    assert "show" in flyout.events
+
+
+def test_relogin_menu_drives_panel_not_console(monkeypatch):
+    """The 'Opnieuw verbinden / inloggen' menu callback drives the PANEL login:
+    it resets the panel to the login step (push_auth_step('login')) + shows the
+    flyout and NEVER calls getpass/input/spike.get_access_token (T-08-06/07)."""
+
+    class PanelFlyout(RecordingFlyout):
+        def __init__(self):
+            super().__init__()
+            self.auth_steps = []
+
+        def push_auth_step(self, step):
+            self.auth_steps.append(step)
+
+    flyout = PanelFlyout()
+    session = _BootstrapSession()
+    # A relogin_handler whose controller flags TOKEN_EXPIRED.
+    relogin_handler = app.make_relogin_handler(
+        None, threading.Event(),
+        get_token=lambda *, force_relogin: (_ for _ in ()).throw(AssertionError("console login")),
+        controller=FakeController(),
+    )
+
+    callback = app.make_panel_relogin(session, flyout, relogin_handler)
+    callback(icon=None, item=None)
+
+    # The panel was reset to the login step and shown.
+    assert "login" in flyout.auth_steps
+    assert "show" in flyout.events
+    # The session was logged out (token cleared + session stopped).
+    assert "logout" in session.calls
+    # TOKEN_EXPIRED flagged for the tray.
+    assert ConnectionStatus.TOKEN_EXPIRED in relogin_handler._controller.statuses
 
 
 # --- Plan 08-02: SessionController wiring + deferred MQTT start --------------

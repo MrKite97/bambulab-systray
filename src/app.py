@@ -6,13 +6,16 @@ Phase 2 tray layer (``render``, ``tray.TrayController``) into a runnable,
 windowless pystray app. It adds ONLY orchestration -- it reimplements none of
 the login, MQTT, merge, render, or marshalling logic.
 
-What it delivers (APP-01 / STAT-02 / STAT-03):
+What it delivers (APP-01 / STAT-02 / STAT-03 / Phase 8 LOGIN/SEL):
 
-  * Token acquisition reuses ``spike.get_access_token`` + ``auth.*`` exactly as
-    ``spike.run_with_relogin`` does -- the first-run verifyCode email-code prompt
-    stays a console ``input()`` this phase (full windowless re-auth is Phase 3).
+  * Login, 2FA, and printer-select happen ENTIRELY in the panel via the real
+    :class:`~src.session.SessionController` -- there is NO console
+    ``input()``/``getpass`` here (Plan 08-02 removed it). On start ``main()``
+    bootstraps from a stored token + serial (validated; 401 -> login screen) or
+    opens the panel on the login screen with a LOGGED-OUT tray glyph.
   * A single long-lived MQTT session runs on a daemon NETWORK thread and writes
-    the shared ``PrintState`` via the vetted ``mqtt_client.on_message`` merge.
+    the shared ``PrintState`` via the vetted ``mqtt_client.on_message`` merge --
+    started ONLY post-login/post-select via the deferred ``start_mqtt`` hook.
   * The pystray ``Icon`` runs on the UI thread; a single dedicated daemon PUMP
     thread (started in ``TrayController.build_setup``) is the ONLY place icon
     attributes are written.
@@ -26,14 +29,13 @@ pump thread drains that queue and is the sole writer of ``icon.icon`` /
 ``icon.title``. Crossing that boundary would mutate the STA Shell_NotifyIcon
 handle off-thread (T-02-03).
 
-SECURITY (threat register T-02-06): the password is read with ``getpass`` (no
-echo, in-memory only); the token / password / MQTT username / Authorization
-header are NEVER logged. Only ``gcode_state`` / ``mc_percent`` /
-``mc_remaining_time`` reach the tooltip via ``render``.
+SECURITY (threat register T-02-06 / T-08-06): no credential is read from the
+console (the panel collects email/password/code); the token / password / MQTT
+username / Authorization header are NEVER logged. Only ``gcode_state`` /
+``mc_percent`` / ``mc_remaining_time`` reach the tooltip via ``render``.
 """
 
 import argparse
-import getpass
 import logging
 import threading
 import time
@@ -865,29 +867,39 @@ def _import_webview():
     """Lazily import the real pywebview module.
 
     Kept out of module import so ``import src.app`` needs no GUI backend (the test
-    suite stays importable headless). Only ``main()`` calls this, and only after
-    a successful login, so a missing backend never breaks importing the package."""
+    suite stays importable headless). Only ``main()`` calls this, so a missing
+    backend never breaks importing the package."""
     import webview
 
     return webview
 
 
 def main(argv=None, *, guard=None, webview=None) -> int:
-    """Prompt for credentials, acquire a token via the reused Phase 1 flow, then
-    run the v2 flyout shell until 'Afsluiten'.
+    """Build the panel-driven app and run the v2 flyout shell until 'Afsluiten'.
 
-    Before doing anything else a single-instance guard runs: if another instance
-    already holds the named mutex, log one line and ``return 0`` cleanly WITHOUT
-    touching the tray or MQTT (threat T-04-06). ``guard`` is injectable so tests
-    drive the already-running path without a real OS mutex.
+    Plan 08-02 (LOCKED, 08-CONTEXT.md "App bootstrap refactor"): main() NO LONGER
+    prompts the console for credentials -- no stdin credential read remains here.
+    Instead it builds the token-less GUI + the real SessionController-backed
+    bridge (:func:`build_gui`), paints the LOGGED-OUT neutral glyph, then runs
+    ``session.bootstrap_from_stored()``: a stored token + remembered serial that
+    validates goes straight to logged-in (MQTT started via the deferred
+    ``start_mqtt`` hook); a rejected/absent token falls to the login screen IN
+    THE PANEL. The flyout is shown on start so the login screen is visible when
+    logged out, and the right-click "Opnieuw verbinden / inloggen" item drives the
+    panel login (not a console prompt).
 
-    THREADING (v2, LOCKED -- 07-CONTEXT.md): the MQTT session runs on a daemon
-    thread; the pystray tray runs via ``icon.run_detached()`` on its OWN thread;
-    and the MAIN thread runs ``webview.start()`` (the GUI loop), which blocks
-    until the flyout is destroyed. 'Afsluiten' destroys the window FIRST so
-    ``webview.start()`` returns; we then signal shutdown, join the network thread,
-    and stop the tray icon -- no orphan icon. ``webview`` is injectable so tests
-    drive the whole loop with a FakeWebview (no real GUI). No secret is logged.
+    Before anything else a single-instance guard runs: a second launch logs one
+    line and ``return 0`` cleanly WITHOUT touching the tray or MQTT (threat
+    T-04-06). ``guard`` is injectable so tests drive the already-running path.
+
+    THREADING (v2, LOCKED -- 07-CONTEXT.md): any MQTT session runs on a daemon
+    thread (started ONLY post-login/post-select by ``start_mqtt``); the pystray
+    tray runs via ``icon.run_detached()`` on its OWN thread; and the MAIN thread
+    runs ``webview.start()`` (the GUI loop), which blocks until the flyout is
+    destroyed. 'Afsluiten' destroys the window FIRST so ``webview.start()``
+    returns; we then signal shutdown and stop the tray icon -- no orphan icon.
+    ``webview`` is injectable so tests drive the whole loop with a FakeWebview (no
+    real GUI). No secret is logged.
     """
     parser = argparse.ArgumentParser(description="Bambu Lab system-tray app.")
     parser.add_argument("--debug", action="store_true", help="enable DEBUG logging")
@@ -906,37 +918,38 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     logger.info("Bambu Lab systray -- starting. Left-click the tray icon to open; right-click -> Afsluiten to quit.")
 
     # Load persisted settings (region/serial) so a remembered serial is available;
-    # defaults are used on a missing/corrupt file (no regression to the login flow).
+    # defaults are used on a missing/corrupt file. The SessionController's
+    # bootstrap reads these to decide logged-in vs login.
     settings = settings_module.load_settings()
     logger.debug("Loaded settings (serial remembered: %s)", settings.get("serial") is not None)
 
-    # Console login fallback (kept from v1 until Phase 8 moves login into the
-    # panel). The credentials are held only in memory and never logged (T-02-06).
-    email = input("Bambu account email: ").strip()
-    # getpass: no echo, in-memory only, never persisted or logged (T-02-06).
-    password = getpass.getpass("Bambu account password: ")
-
-    try:
-        token = spike.get_access_token(email, password)
-    except SystemExit as exc:
-        logger.error("%s", exc)
-        return 1
-
-    # The real pywebview backend is imported lazily and only now (after login).
+    # The real pywebview backend is imported lazily (the test suite injects a
+    # FakeWebview). No login happens before this -- the panel drives auth now.
     if webview is None:
         webview = _import_webview()
 
-    # Pass the credentials so the menu/401 re-login can drive a fresh login, and
-    # the webview backend so the flyout window is created against the real GUI.
-    wired = build_app(token, email=email, password=password, webview=webview)
-    icon = wired["icon"]
-    controller = wired["controller"]
-    shutdown_event = wired["shutdown_event"]
+    # Build the token-less GUI/bridge/menu + the real SessionController-backed
+    # handlers and deferred MQTT hooks. NO token is required to construct this.
+    gui = build_gui(webview=webview)
+    icon = gui["icon"]
+    controller = gui["controller"]
+    shutdown_event = gui["shutdown_event"]
+    flyout = gui["flyout"]
+    session = gui["session"]
 
-    network_thread = threading.Thread(
-        target=wired["network_runner"], name="mqtt-network", daemon=True
-    )
-    network_thread.start()
+    # Start LOGGED-OUT: the tray shows the neutral glyph until a login completes
+    # (bootstrap flips it when a stored session validates). render_icon(None) is
+    # the neutral/logged-out frame.
+    icon.icon = render.render_icon(None)
+
+    # Decide logged-in vs login screen from the stored token + serial. A validated
+    # stored session starts MQTT (via start_mqtt) and opens on progress; a
+    # rejected/absent token resets the panel to the login screen.
+    session.bootstrap_from_stored()
+
+    # Show the flyout on start so the login screen is visible when logged out (the
+    # user logs in entirely in the panel -- no console prompt).
+    flyout.show()
 
     # v2 threading inversion: the tray runs on its OWN thread (run_detached) so
     # the MAIN thread is free to run webview.start(). make_setup paints the first
@@ -950,7 +963,6 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     # webview.start() returned -> the window was destroyed (Afsluiten). Tear down
     # the rest defensively so a teardown error never leaves an orphan tray icon.
     shutdown_event.set()
-    network_thread.join(timeout=5)
     try:
         icon.stop()  # idempotent: if Afsluiten already stopped it this is a no-op
     except Exception:  # noqa: BLE001 - never raise out of the clean-exit path
