@@ -139,3 +139,88 @@ def test_partial_delta_leaves_gcode_file_unchanged():
     assert s.gcode_file == "plate_1.gcode"  # unchanged
     s.merge({"gcode_file": None})  # explicit None
     assert s.gcode_file == "plate_1.gcode"  # still not clobbered
+
+
+# --- Phase 5 Task 2: nozzle + bed temperature fields ---
+
+
+def test_nozzle_temps_merge():
+    """A report carrying nozzle_temper/nozzle_target_temper exposes both floats."""
+    s = PrintState()
+    s.merge({"nozzle_temper": 215.0, "nozzle_target_temper": 220.0})
+    assert s.nozzle_temper == 215.0
+    assert s.nozzle_target_temper == 220.0
+
+
+def test_bed_temps_merge():
+    """A report carrying bed_temper/bed_target_temper exposes both floats."""
+    s = PrintState()
+    s.merge({"bed_temper": 60.0, "bed_target_temper": 65.0})
+    assert s.bed_temper == 60.0
+    assert s.bed_target_temper == 65.0
+
+
+def test_temps_default_zero():
+    """Fresh PrintState has all four temp fields == 0.0."""
+    s = PrintState()
+    assert s.nozzle_temper == 0.0
+    assert s.nozzle_target_temper == 0.0
+    assert s.bed_temper == 0.0
+    assert s.bed_target_temper == 0.0
+
+
+def test_partial_delta_leaves_other_temps_unchanged():
+    """A partial delta {nozzle_temper} leaves the other three temps unchanged."""
+    s = PrintState()
+    s.merge(
+        {
+            "nozzle_temper": 215.0,
+            "nozzle_target_temper": 220.0,
+            "bed_temper": 60.0,
+            "bed_target_temper": 65.0,
+        }
+    )
+    s.merge({"nozzle_temper": 200.0})
+    assert s.nozzle_temper == 200.0  # updated
+    assert s.nozzle_target_temper == 220.0  # unchanged
+    assert s.bed_temper == 60.0  # unchanged
+    assert s.bed_target_temper == 65.0  # unchanged
+
+
+def test_none_temp_does_not_clobber():
+    """An explicit None for a temp field must not clobber a prior good value."""
+    s = PrintState()
+    s.merge({"nozzle_temper": 215.0})
+    s.merge({"nozzle_temper": None})
+    assert s.nozzle_temper == 215.0
+
+
+def test_combined_merge_all_fields_coexist():
+    """Regression: one merge carrying v1 + layer + file + temp fields sets all."""
+    s = PrintState()
+    s.merge(
+        {
+            "gcode_state": "running",
+            "mc_percent": 42,
+            "mc_remaining_time": 83,
+            "layer_num": 132,
+            "total_layer_num": 198,
+            "gcode_file": "Metadata/plate_1.gcode",
+            "subtask_name": "3DBenchy.gcode",
+            "nozzle_temper": 215.0,
+            "nozzle_target_temper": 220.0,
+            "bed_temper": 60.0,
+            "bed_target_temper": 65.0,
+        }
+    )
+    assert s.gcode_state == "running"
+    assert s.mc_percent == 42
+    assert s.mc_remaining_time == 83
+    assert s.layer_num == 132
+    assert s.total_layer_num == 198
+    assert s.gcode_file == "plate_1.gcode"
+    assert s.subtask_name == "3DBenchy.gcode"
+    assert s.nozzle_temper == 215.0
+    assert s.nozzle_target_temper == 220.0
+    assert s.bed_temper == 60.0
+    assert s.bed_target_temper == 65.0
