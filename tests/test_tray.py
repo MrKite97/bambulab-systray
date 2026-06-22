@@ -303,3 +303,115 @@ def test_build_setup_tolerates_icon_without_visible_attr():
     ctrl.build_setup()(icon)  # must not raise
 
     assert icon.title == "42% — nog 1u 23m"
+
+
+# --- Task 3 (this plan): connection/token status marshalling ----------------
+#
+# Connection/token status is a PARALLEL marshalled signal alongside PrintState.
+# These tests prove (1) it is enqueue-only off the UI thread (no icon mutation),
+# (2) a connection transition repaints exactly once with the correct locked
+# tooltip, (3) the token-expired state surfaces its locked tooltip, (4) the
+# freshness-driven offline state is reachable via an injected clock (no real
+# waits), and (5) an unchanged derived display debounces to a single repaint.
+
+
+def test_set_connection_status_does_not_touch_icon():
+    """set_connection_status from a non-UI thread enqueues only -- it must NOT
+    mutate the icon at all before pump_once (icon stays None, count 0)."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = tray.TrayController(icon, state)
+
+    t = threading.Thread(
+        target=ctrl.set_connection_status, args=(ConnectionStatus.CONNECTED,)
+    )
+    t.start()
+    t.join()
+
+    # Nothing painted before the UI thread pumps.
+    assert icon.icon is None
+    assert icon.title is None
+    assert icon.icon_set_count == 0
+
+
+def test_connection_transition_repaints_once():
+    """CONNECTED + active paints; flipping to DISCONNECTED enqueues and pump_once
+    repaints exactly once with the locked 'Verbinden…' tooltip."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = _connected(icon, state)
+
+    ctrl.on_state_change()
+    ctrl.pump_once()  # paint #1: active print
+    assert icon.icon_set_count == 1
+    assert icon.title == "42% — nog 1u 23m"
+
+    ctrl.set_connection_status(ConnectionStatus.DISCONNECTED)  # enqueue only
+    ctrl.pump_once()  # exactly one more repaint
+
+    assert icon.icon_set_count == 2
+    assert icon.title == "Verbinden…"
+
+
+def test_token_expired_status_shows_relogin_tooltip():
+    """A TOKEN_EXPIRED connection status surfaces the locked re-login tooltip."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = _connected(icon, state)
+
+    ctrl.set_connection_status(ConnectionStatus.TOKEN_EXPIRED)
+    ctrl.pump_once()
+
+    assert icon.title == "Opnieuw inloggen vereist"
+    assert icon.icon_set_count == 1
+
+
+def test_freshness_offline_via_injected_clock():
+    """CONNECTED + idle: within the freshness window the derived display is
+    NO_ACTIVE_PRINT ('Geen actieve print'); once the injected clock advances past
+    FRESHNESS_TIMEOUT_SECONDS it becomes PRINTER_OFFLINE ('Printer offline') --
+    proven with no real waits."""
+    icon = FakeIcon()
+    clock = _FakeClock()
+    state = PrintState(
+        gcode_state="IDLE",
+        mc_percent=0,
+        mc_remaining_time=0,
+        last_update_monotonic=clock.value,
+    )
+    ctrl = _connected(icon, state, now=clock)
+
+    # Within the freshness window: no active print, not offline.
+    ctrl.on_state_change()
+    ctrl.pump_once()
+    assert icon.title == "Geen actieve print"
+    assert (
+        status.derive_display_state(state, ConnectionStatus.CONNECTED, clock())
+        is DisplayState.NO_ACTIVE_PRINT
+    )
+
+    # Advance past the timeout: same idle state now derives offline.
+    clock.advance(FRESHNESS_TIMEOUT_SECONDS + 1)
+    ctrl.on_state_change()
+    ctrl.pump_once()
+    assert icon.title == "Printer offline"
+    assert (
+        status.derive_display_state(state, ConnectionStatus.CONNECTED, clock())
+        is DisplayState.PRINTER_OFFLINE
+    )
+
+
+def test_unchanged_display_debounces():
+    """Two set_connection_status(DISCONNECTED) in a row collapse to a single
+    repaint -- the derived display (CLOUD_DISCONNECTED) is unchanged."""
+    icon = FakeIcon()
+    state = _active(42, 83)
+    ctrl = _connected(icon, state)
+
+    ctrl.set_connection_status(ConnectionStatus.DISCONNECTED)
+    ctrl.pump_once()  # paint #1: CLOUD_DISCONNECTED
+    ctrl.set_connection_status(ConnectionStatus.DISCONNECTED)  # identical display
+    ctrl.pump_once()  # debounced -> no second paint
+
+    assert icon.icon_set_count == 1
+    assert icon.title == "Verbinden…"
