@@ -205,3 +205,44 @@ def test_render_for_display_state_glyphs_fit_canvas():
         bbox = img.getbbox()
         assert bbox is not None
         assert bbox[2] <= ICON_SIZE and bbox[3] <= ICON_SIZE, f"{ds} overflows: {bbox}"
+
+
+# --- tooltip_for_display_state (exact locked Dutch strings, all 5 states) ---
+
+
+def test_tooltip_for_display_state_active_body():
+    """ACTIVE_PRINT tooltip is the exact active body 'NN% — nog Xu Ym'."""
+    st = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    assert tooltip_for_display_state(DisplayState.ACTIVE_PRINT, st) == "47% — nog 1u 23m"
+
+
+def test_tooltip_for_display_state_locked_constant_strings():
+    """The four non-active states return their exact locked Dutch constants."""
+    st = _state(gcode_state="IDLE")
+    assert tooltip_for_display_state(DisplayState.NO_ACTIVE_PRINT, st) == "Geen actieve print"
+    assert tooltip_for_display_state(DisplayState.PRINTER_OFFLINE, st) == "Printer offline"
+    assert tooltip_for_display_state(DisplayState.CLOUD_DISCONNECTED, st) == "Verbinden…"
+    assert tooltip_for_display_state(DisplayState.TOKEN_EXPIRED, st) == "Opnieuw inloggen vereist"
+
+
+def test_tooltip_for_display_state_delegates_to_status():
+    """tooltip_for_display_state returns exactly status.tooltip_for (thin delegate)."""
+    from src import status
+
+    st = _state(gcode_state="RUNNING", mc_percent=12, mc_remaining_time=5)
+    for ds in DisplayState:
+        assert tooltip_for_display_state(ds, st) == status.tooltip_for(ds, st)
+
+
+def test_non_active_states_never_leak_stale_numbers():
+    """A PrintState carrying percent=47/remaining=83 shows no '47%' / 'nog' when not active."""
+    stale = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    for ds in (
+        DisplayState.NO_ACTIVE_PRINT,
+        DisplayState.PRINTER_OFFLINE,
+        DisplayState.CLOUD_DISCONNECTED,
+        DisplayState.TOKEN_EXPIRED,
+    ):
+        tip = tooltip_for_display_state(ds, stale)
+        assert "47%" not in tip, f"{ds} leaked stale percent: {tip!r}"
+        assert "nog" not in tip, f"{ds} leaked stale remaining: {tip!r}"
