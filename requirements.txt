@@ -3,3 +3,6 @@ keyring==25.7.0
 requests>=2.32
 pystray==0.19.5
 Pillow==12.2.0
+
+# build/dev only
+pyinstaller==6.21.0
