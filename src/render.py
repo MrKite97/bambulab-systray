@@ -96,6 +96,167 @@ def render_icon(text: str | None) -> Image.Image:
     return img
 
 
+# --- Printer-fill glyph (Phase 6) ------------------------------------------
+# The tray icon is a printer-frame outline whose FRAME color is the status
+# color (printing=blue, paused=amber, done=green, error=red) and whose build
+# area FILLs bottom-to-top with neutral material grey by progress. Keeping the
+# fill neutral (never the status color) means the colored contour stays legible
+# even at pct=1, where the fill is a thin sliver. Logged-out / neutral renders
+# the frame in grey with NO fill. Colors are theme-aware (Windows dark/light).
+#
+# Status-color tokens are LOCKED by 06-CONTEXT.md / the Design Tokens table.
+# The literal hex strings are kept in source so the locked map stays greppable.
+
+# dark theme: printing #54C5FF, paused #FFCB45, done #6FD06A, error #FF8A95,
+#             neutral #9AA0AA  (neutral is also the fill material grey)
+# light theme: printing #0067C0, paused #9A5B00, done #107C10, error #C42B1C,
+#              neutral #888892
+_STATUS_HEX = {
+    "dark": {
+        "printing": "#54C5FF",
+        "paused": "#FFCB45",
+        "done": "#6FD06A",
+        "error": "#FF8A95",
+        "neutral": "#9AA0AA",
+    },
+    "light": {
+        "printing": "#0067C0",
+        "paused": "#9A5B00",
+        "done": "#107C10",
+        "error": "#C42B1C",
+        "neutral": "#888892",
+    },
+}
+
+
+def _hex_to_rgba(hexstr: str) -> tuple[int, int, int, int]:
+    """Parse a ``#RRGGBB`` string to an ``(r, g, b, 255)`` tuple (fully opaque)."""
+    h = hexstr.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+
+def status_to_color(status: str, theme: str) -> tuple[int, int, int, int]:
+    """Map an app status + theme to its locked frame color (RGBA, alpha 255).
+
+    ``status`` is one of printing/paused/done/error/neutral; any unknown value
+    falls back to the theme's neutral grey (never raises). ``theme`` is
+    ``"dark"`` or ``"light"`` (anything else is treated as dark).
+    """
+    table = _STATUS_HEX.get(theme, _STATUS_HEX["dark"])
+    hexstr = table.get(status, table["neutral"])
+    return _hex_to_rgba(hexstr)
+
+
+def status_from_gcode_state(gcode_state: str) -> str:
+    """Map a raw broker ``gcode_state`` to a status key (never raises).
+
+    RUNNING -> "printing", PAUSE -> "paused", FINISH -> "done",
+    FAILED -> "error"; IDLE / PREPARE / unknown / "" -> "neutral".
+    Classification is ``.upper()``-guarded set membership so any garbage string
+    falls through to "neutral" (mirrors :func:`is_active_print`).
+    """
+    s = (gcode_state or "").upper()
+    if s == "RUNNING":
+        return "printing"
+    if s == "PAUSE":
+        return "paused"
+    if s == "FINISH":
+        return "done"
+    if s == "FAILED":
+        return "error"
+    return "neutral"
+
+
+# Windows light/dark theme detection. The whole registry read is wrapped so a
+# missing key, a non-Windows host, or an unavailable winreg never crashes the
+# always-on tray -- it defaults to "dark".
+_THEME_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
+try:  # winreg is stdlib on Windows, absent on non-Windows CI runners.
+    import winreg  # type: ignore
+except ImportError:  # pragma: no cover - non-Windows
+    winreg = None  # type: ignore
+
+
+def detect_windows_theme() -> str:
+    """Return ``"light"`` or ``"dark"`` from the Windows Personalize registry key.
+
+    Reads ``SystemUsesLightTheme`` (1 = light, 0 = dark). Any failure -- key
+    missing, value missing, winreg unavailable, non-Windows -- returns ``"dark"``
+    and never raises (the tray must keep running).
+    """
+    if winreg is None:
+        return "dark"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _THEME_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, "SystemUsesLightTheme")
+        return "light" if val == 1 else "dark"
+    except Exception:
+        return "dark"
+
+
+# Printer-frame geometry on the 64x64 canvas. The build area is the inner region
+# the printed object fills; the fill runs flush to the plate (no bottom gap).
+_BUILD_LEFT = 14
+_BUILD_RIGHT = 50
+_BUILD_TOP = 18
+_PLATE_Y = 50
+_FRAME_STROKE = 4
+
+
+def render_printer_icon(
+    pct: int,
+    status: str,
+    *,
+    theme: str | None = None,
+    logged_out: bool = False,
+) -> Image.Image:
+    """Render the printer-fill tray glyph as a 64x64 RGBA image.
+
+    The printer frame (body outline + build plate) is drawn in
+    ``status_to_color(status, theme)``. The build area fills bottom-to-top with
+    NEUTRAL material grey (never the status color) to a height of
+    ``pct/100 x build-area height``, clipped to the build area and flush to the
+    plate. ``pct`` is clamped to 0..100. The fill is drawn ONLY when there is an
+    active status (not ``logged_out`` and ``status != "neutral"``) and the fill
+    height is non-zero; logged-out / neutral renders a grey frame with no fill.
+    """
+    theme = theme or detect_windows_theme()
+    frame_color = status_to_color(status, theme)
+    neutral_fill = status_to_color("neutral", theme)
+
+    img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # Fill the build area FIRST (neutral grey), then stroke the frame on top so
+    # the colored contour always wins where they overlap (keeps pct=1 legible).
+    show_fill = not logged_out and status != "neutral"
+    if show_fill:
+        build_h = _PLATE_Y - _BUILD_TOP
+        fill_h = round(max(0, min(100, pct)) / 100 * build_h)
+        if fill_h > 0:
+            fill_top = _PLATE_Y - fill_h
+            d.rectangle(
+                [_BUILD_LEFT, fill_top, _BUILD_RIGHT, _PLATE_Y],
+                fill=neutral_fill,
+            )
+
+    # Printer body outline (the build-area rectangle) + the build plate line,
+    # both in the frame/status color at full stroke.
+    d.rectangle(
+        [_BUILD_LEFT, _BUILD_TOP, _BUILD_RIGHT, _PLATE_Y],
+        outline=frame_color,
+        width=_FRAME_STROKE,
+    )
+    # Emphasize the build plate (bottom) as a solid base line.
+    d.line(
+        [(_BUILD_LEFT, _PLATE_Y), (_BUILD_RIGHT, _PLATE_Y)],
+        fill=frame_color,
+        width=_FRAME_STROKE,
+    )
+    return img
+
+
 def render_for_state(state: PrintState) -> Image.Image:
     """Icon for a PrintState: time digits when active, neutral glyph when idle."""
     return render_icon(icon_text(state))

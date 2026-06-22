@@ -323,16 +323,25 @@ def test_detect_windows_theme_returns_valid_value():
 # Build-area geometry (mirrors render.py constants; sampled in tests).
 _BUILD_LEFT, _BUILD_RIGHT = 14, 50
 _BUILD_TOP, _PLATE_Y = 18, 50
+_FRAME_STROKE = 4
 _BUILD_CENTER_X = (_BUILD_LEFT + _BUILD_RIGHT) // 2
 
 
-def _fill_column_opaque_count(img, x):
-    """Count opaque pixels strictly inside the build area at column x."""
+def _fill_column_height(img, x, theme="dark"):
+    """Count neutral-grey FILL pixels strictly inside the build area at column x.
+
+    Only pixels equal to the neutral fill color are counted, so frame-stroke
+    pixels that happen to cross this column are excluded -- this measures the
+    material fill height, not the frame.
+    """
     px = img.load()
+    fill = status_to_color("neutral", theme)
+    # Sample strictly between the top frame stroke and the plate stroke so a
+    # grey frame (neutral status) is not mistaken for fill.
     return sum(
         1
-        for y in range(_BUILD_TOP + 1, _PLATE_Y)
-        if px[x, y][3] == 255
+        for y in range(_BUILD_TOP + _FRAME_STROKE, _PLATE_Y - _FRAME_STROKE)
+        if px[x, y] == fill
     )
 
 
@@ -347,8 +356,8 @@ def test_render_printer_icon_fill_height_grows_with_pct():
     """A higher pct produces a taller neutral-grey fill column."""
     low = render_printer_icon(10, "printing", theme="dark")
     high = render_printer_icon(80, "printing", theme="dark")
-    low_h = _fill_column_opaque_count(low, _BUILD_CENTER_X)
-    high_h = _fill_column_opaque_count(high, _BUILD_CENTER_X)
+    low_h = _fill_column_height(low, _BUILD_CENTER_X)
+    high_h = _fill_column_height(high, _BUILD_CENTER_X)
     assert high_h > low_h, f"expected pct=80 taller than pct=10 ({high_h} <= {low_h})"
 
 
@@ -366,8 +375,9 @@ def test_render_printer_icon_fill_is_neutral_not_status():
     """The fill column is neutral material grey, never the status color."""
     img = render_printer_icon(80, "printing", theme="dark")
     px = img.load()
-    # A pixel near the plate, inside the build area, is in the fill at pct=80.
-    fill_pixel = px[_BUILD_CENTER_X, _PLATE_Y - 2]
+    # Mid-fill, clear of the plate stroke: at pct=80 the fill reaches ~y=24,
+    # so y=40 at the build center is solidly inside the neutral fill.
+    fill_pixel = px[_BUILD_CENTER_X, 40]
     assert fill_pixel == status_to_color("neutral", "dark") == (154, 160, 170, 255)
     assert fill_pixel != status_to_color("printing", "dark")
 
@@ -376,13 +386,13 @@ def test_render_printer_icon_logged_out_has_no_fill():
     """logged_out=True renders a frame but no opaque pixels strictly inside the build area."""
     img = render_printer_icon(80, "printing", theme="dark", logged_out=True)
     # No fill column at the build center.
-    assert _fill_column_opaque_count(img, _BUILD_CENTER_X) == 0
+    assert _fill_column_height(img, _BUILD_CENTER_X) == 0
 
 
 def test_render_printer_icon_neutral_status_has_no_fill():
     """status='neutral' renders a grey frame with no fill column (ICON-02)."""
     img = render_printer_icon(80, "neutral", theme="dark")
-    assert _fill_column_opaque_count(img, _BUILD_CENTER_X) == 0
+    assert _fill_column_height(img, _BUILD_CENTER_X) == 0
 
 
 def test_render_printer_icon_pct1_frame_fully_visible():
