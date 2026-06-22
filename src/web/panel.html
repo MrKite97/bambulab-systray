@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bambu Lab systray</title>
+<!--
+  Standalone flyout page for the Bambu Lab systray app (Phase 7, plan 07-01).
+
+  This is a hand-rebuilt, plain HTML/CSS/vanilla-JS recreation of the design handoff
+  (design_handoff_printer_tray/3D-printer voortgang.dc.html). The handoff is a design-tool
+  artifact (proprietary DCLogic runtime + helper script + {{ }} interpolation) that does NOT
+  run in a bare WebView2 browser, so none of that engine is reproduced here.
+
+  The page is a PURE VIEW:
+    Python -> page : window.applyState / applyTheme / applyAuthStep / applyDevices / applyError
+    page -> Python : window.pywebview.api.{hide, get_initial_state, login_submit, submit_code,
+                     resend_code, select_printer, logout, control}
+
+  SECURITY: the page contains no secrets. It only renders values pushed via applyState
+  (pct/temps/layer/file/status/printerName). Inputs (email/password/code) are read on submit
+  and handed straight to the api; the password is never written back into the DOM or logged.
+  No external <script>/<link> origins -- file://-local only; fonts fall back to Segoe UI.
+-->
+<style>
+  /* ---- animations (from the design: dot pulse + progress-bar sheen) ---- */
+  @keyframes tbBlink { 0%,100%{opacity:1} 50%{opacity:.3} }
+  @keyframes tbShim  { 0%{transform:translateX(-120%)} 100%{transform:translateX(260%)} }
+
+  * { box-sizing:border-box; }
+  html, body { margin:0; padding:0; }
+
+  body {
+    font-family:'Segoe UI Variable','Segoe UI',system-ui,-apple-system,'Helvetica Neue',sans-serif;
+    width:352px;
+    background:transparent;
+    -webkit-user-select:none;
+    user-select:none;
+  }
+
+  /* ---------------------------------------------------------------------------
+     Design tokens as CSS custom properties. Defaults = DARK theme.
+     applyTheme('light') sets <html data-theme="light"> which overrides them below.
+     --------------------------------------------------------------------------- */
+  :root {
+    --bambu-green:#00AE42;
+
+    --status-printing:#54C5FF;
+    --status-paused:#FFCB45;
+    --status-done:#6FD06A;
+    --status-error:#FF8A95;
+    --status-offline:#9aa0aa;
+
+    --flyout-bg:rgba(43,43,47,.92);
+    --flyout-border:rgba(255,255,255,.08);
+
+    --text-primary:#ffffff;
+    --text-secondary:rgba(255,255,255,.62);
+
+    --tile-bg:rgba(255,255,255,.05);
+    --tile-border:rgba(255,255,255,.07);
+
+    --track2:rgba(255,255,255,.14);
+
+    --btn-bg:rgba(255,255,255,.06);
+    --btn-border:rgba(255,255,255,.12);
+    --btn-hover:rgba(255,255,255,.12);
+
+    --input-bg:rgba(255,255,255,.05);
+    --input-border:rgba(255,255,255,.14);
+  }
+
+  html[data-theme="light"] {
+    --status-printing:#0067C0;
+    --status-paused:#9A5B00;
+    --status-done:#107C10;
+    --status-error:#C42B1C;
+    --status-offline:#888892;
+
+    --flyout-bg:rgba(251,251,253,.92);
+    --flyout-border:rgba(0,0,0,.07);
+
+    --text-primary:#1a1a20;
+    --text-secondary:rgba(0,0,0,.55);
+
+    --tile-bg:rgba(0,0,0,.025);
+    --tile-border:rgba(0,0,0,.06);
+
+    --track2:rgba(0,0,0,.10);
+
+    --btn-bg:rgba(0,0,0,.02);
+    --btn-border:rgba(0,0,0,.12);
+    --btn-hover:rgba(0,0,0,.05);
+
+    --input-bg:#ffffff;
+    --input-border:rgba(0,0,0,.16);
+  }
+
+  /* ---- flyout shell ---- */
+  .flyout {
+    width:352px;
+    padding:18px;
+    border-radius:10px;
+    background:var(--flyout-bg);
+    border:1px solid var(--flyout-border);
+    -webkit-backdrop-filter:blur(40px) saturate(150%);
+    backdrop-filter:blur(40px) saturate(150%);
+    box-shadow:0 18px 44px -10px rgba(0,0,0,.4), 0 4px 12px rgba(0,0,0,.18);
+  }
+
+  /* ---- screen visibility (one screen visible at a time) ---- */
+  .screen { display:none; }
+  .screen.active { display:block; }
+
+  /* ---- shared text helpers ---- */
+  .t-primary { color:var(--text-primary); }
+  .t-secondary { color:var(--text-secondary); }
+
+  /* ---- brand header (login + code) ---- */
+  .brand {
+    display:flex; flex-direction:column; align-items:center; text-align:center;
+    gap:9px; padding-top:2px;
+  }
+  .brand-mark {
+    width:42px; height:42px; border-radius:11px;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--bambu-green);
+  }
+  .brand-title { font-size:15px; font-weight:600; color:var(--text-primary); }
+  .brand-sub   { font-size:12.5px; line-height:1.45; color:var(--text-secondary); }
+
+  /* ---- inputs ---- */
+  .field {
+    height:38px; padding:0 12px; border-radius:7px;
+    border:1px solid var(--input-border); background:var(--input-bg);
+    color:var(--text-primary); font-size:13px; font-family:inherit; outline:none;
+    width:100%;
+    -webkit-user-select:text; user-select:text;
+  }
+  .field:focus { border-color:var(--bambu-green); }
+
+  .code-field {
+    height:46px; text-align:center; letter-spacing:.42em;
+    padding:0 12px 0 18px; border-radius:8px; font-size:22px; font-weight:600;
+  }
+
+  /* ---- buttons ---- */
+  .btn-primary {
+    width:100%; height:39px; border:none; border-radius:7px;
+    background:var(--bambu-green); color:#fff; font-size:13.5px; font-weight:600;
+    cursor:pointer; font-family:inherit;
+  }
+  .btn-primary:hover { filter:brightness(1.06); }
+
+  .btn-outline {
+    height:38px; display:flex; align-items:center; justify-content:center; gap:7px;
+    border:1px solid var(--input-border); border-radius:7px; background:var(--input-bg);
+    color:var(--text-primary); font-size:12.5px; font-weight:500; cursor:pointer;
+    font-family:inherit;
+  }
+  .btn-outline:hover { background:var(--btn-hover); }
+
+  .link { color:var(--bambu-green); cursor:pointer; font-weight:500; }
+  .link-muted { color:var(--text-secondary); cursor:pointer; }
+
+  .divider-row { margin-top:15px; display:flex; align-items:center; gap:10px; }
+  .divider { flex:1; height:1px; background:var(--btn-border); }
+
+  /* ---- error banner ---- */
+  .error-banner {
+    display:none;
+    margin-top:12px; padding:9px 12px; border-radius:7px;
+    background:rgba(255,138,149,.14); border:1px solid var(--status-error);
+    color:var(--status-error); font-size:12px; line-height:1.4;
+  }
+  .error-banner.visible { display:block; }
+
+  /* ---- select-printer rows ---- */
+  .printer-row {
+    display:flex; align-items:center; gap:11px; padding:10px 12px;
+    border-radius:9px; border:1px solid var(--input-border); background:var(--input-bg);
+    cursor:pointer;
+  }
+  .printer-row:hover { border-color:var(--bambu-green); }
+  .printer-tile {
+    width:34px; height:34px; flex:none; border-radius:8px;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--tile-bg); color:var(--text-primary);
+  }
+
+  /* ---- progress panel ---- */
+  .pp-tile {
+    width:38px; height:38px; border-radius:9px;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--tile-bg);
+  }
+  .gear-btn {
+    width:32px; height:32px; border-radius:7px;
+    display:flex; align-items:center; justify-content:center;
+    cursor:pointer; color:var(--text-secondary); background:transparent; border:none;
+  }
+  .gear-btn:hover { background:var(--btn-hover); color:var(--text-primary); }
+
+  .pct-big { font-size:32px; font-weight:600; letter-spacing:-.02em; color:var(--text-primary); }
+  .pct-sign { font-size:19px; font-weight:600; }
+
+  .bar-track {
+    margin-top:11px; height:7px; border-radius:99px;
+    background:var(--track2); overflow:hidden;
+  }
+  .bar-fill {
+    height:100%; border-radius:99px; width:0%;
+    position:relative; overflow:hidden;
+  }
+  .bar-sheen {
+    position:absolute; inset:0;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);
+  }
+
+  .temps { margin-top:18px; display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+  .temp-tile {
+    background:var(--tile-bg); border:1px solid var(--tile-border);
+    border-radius:9px; padding:11px 13px; display:flex; flex-direction:column; gap:5px;
+  }
+  .temp-label {
+    display:flex; align-items:center; gap:6px;
+    font-size:11.5px; font-weight:500; color:var(--text-secondary);
+  }
+  .temp-value { font-size:19px; font-weight:600; color:var(--text-primary); }
+  .temp-target { font-size:11px; color:var(--text-secondary); }
+
+  .controls { margin-top:18px; display:flex; gap:9px; }
+  .ctrl-primary {
+    flex:1; height:36px; border:none; border-radius:7px;
+    background:var(--bambu-green); color:#fff; font-size:13px; font-weight:600;
+    cursor:pointer; font-family:inherit;
+  }
+  .ctrl-primary:hover { filter:brightness(1.08); }
+  .ctrl-cancel {
+    flex:1; height:36px; border:1px solid var(--btn-border); border-radius:7px;
+    background:var(--btn-bg); color:var(--text-primary); font-size:13px; font-weight:600;
+    cursor:pointer; font-family:inherit;
+  }
+  .ctrl-cancel:hover { background:var(--btn-hover); }
+
+  .status-dot { width:7px; height:7px; border-radius:99px; }
+</style>
+</head>
+<body>
+<div class="flyout">
+
+  <!-- ===================== B4. PROGRESS PANEL (logged in) ===================== -->
+  <div class="screen" id="screen-progress">
+    <!-- header -->
+    <div style="display:flex; align-items:center; gap:11px;">
+      <div class="pp-tile" id="pp-tile" style="color:var(--status-printing);">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none"><path d="M7 9V4h10v5M7 18H5a2 2 0 0 1-2-2v-3.5A2.5 2.5 0 0 1 5.5 10h13A2.5 2.5 0 0 1 21 12.5V16a2 2 0 0 1-2 2h-2M7 14.5h10V20H7z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:3px;">
+        <span style="font-size:14.5px; font-weight:600; color:var(--text-primary);" id="pp-name">Printer</span>
+        <span style="display:flex; align-items:center; gap:6px; font-size:12px; font-weight:500;" id="pp-status-line">
+          <span class="status-dot" id="pp-status-dot"></span>
+          <span id="pp-status-label">Bezig met printen</span>
+        </span>
+      </div>
+      <div style="flex:1;"></div>
+      <button class="gear-btn" id="btn-gear" title="Andere printer kiezen" type="button">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M19.43 12.98c.04-.32.07-.65.07-.98s-.03-.66-.07-.98l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1a7.3 7.3 0 0 0-1.69-.98l-.38-2.65A.49.49 0 0 0 14 2h-4a.49.49 0 0 0-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46c.14.24.42.32.61.22l2.49-1c.52.39 1.08.73 1.69.98l.38 2.65c.04.24.25.42.49.42h4c.24 0 .45-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.19.1.47.02.61-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+    </div>
+
+    <!-- progress -->
+    <div style="margin-top:18px;">
+      <div style="display:flex; align-items:baseline; justify-content:space-between;">
+        <span class="pct-big"><span id="pp-pct">0</span><span class="pct-sign">%</span></span>
+        <span style="font-size:12.5px; color:var(--text-secondary);" id="pp-eta">nog -</span>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill" id="pp-bar">
+          <div class="bar-sheen" id="pp-sheen"></div>
+        </div>
+      </div>
+      <div style="margin-top:9px; font-size:12px; color:var(--text-secondary);" id="pp-caption">bestand &middot; laag 0/0</div>
+    </div>
+
+    <!-- temps -->
+    <div class="temps">
+      <div class="temp-tile">
+        <span class="temp-label">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M8.5 4h7l-1 8.5-2.5 3.5-2.5-3.5L8.5 4z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+          Nozzle
+        </span>
+        <span class="temp-value"><span id="pp-nozzle">0</span> &deg;C</span>
+        <span class="temp-target">doel <span id="pp-nozzle-target">0</span> &deg;C</span>
+      </div>
+      <div class="temp-tile">
+        <span class="temp-label">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="3" y="9" width="18" height="8" rx="1.6" stroke="currentColor" stroke-width="1.6"/><path d="M6.5 9V7M12 9V6.5M17.5 9V7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          Bed
+        </span>
+        <span class="temp-value"><span id="pp-bed">0</span> &deg;C</span>
+        <span class="temp-target">doel <span id="pp-bed-target">0</span> &deg;C</span>
+      </div>
+    </div>
+
+    <!-- controls -->
+    <div class="controls">
+      <button class="ctrl-primary" id="btn-control-primary" type="button">Pauzeren</button>
+      <button class="ctrl-cancel" id="btn-control-cancel" type="button">Annuleren</button>
+    </div>
+  </div>
+
+  <!-- ===================== B1. LOGIN (credentials) ===================== -->
+  <div class="screen" id="screen-login">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="23" height="23" viewBox="0 0 24 24" fill="none"><path d="M12 2.6 20.2 7v10L12 21.4 3.8 17V7L12 2.6Z" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/><path d="M3.9 7.1 12 11.8l8.1-4.7M12 11.8v9.4" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:3px;">
+        <span class="brand-title">Bambu Lab account</span>
+        <span class="brand-sub">Meld je aan om je printer te beheren</span>
+      </div>
+    </div>
+
+    <div style="margin-top:16px; display:flex; flex-direction:column; gap:9px;">
+      <input class="field" id="input-email" type="text" placeholder="E-mailadres" autocomplete="username" />
+      <input class="field" id="input-password" type="password" placeholder="Wachtwoord" autocomplete="current-password" />
+    </div>
+
+    <div style="margin-top:9px; display:flex; justify-content:flex-end;">
+      <span class="link" style="font-size:12px;">Wachtwoord vergeten?</span>
+    </div>
+
+    <button class="btn-primary" id="btn-login" style="margin-top:11px;" type="button">Inloggen</button>
+
+    <div class="divider-row">
+      <div class="divider"></div>
+      <span style="font-size:11px; color:var(--text-secondary);">of ga verder met</span>
+      <div class="divider"></div>
+    </div>
+
+    <div style="margin-top:13px; display:flex; gap:9px;">
+      <button class="btn-outline" style="flex:1;" type="button">
+        <svg width="15" height="15" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.5 12.2c0-.7-.06-1.4-.18-2.06H12v3.9h5.9a5 5 0 0 1-2.18 3.3v2.7h3.52c2.06-1.9 3.26-4.7 3.26-7.84Z"/><path fill="#34A853" d="M12 23c2.94 0 5.4-.97 7.2-2.63l-3.52-2.73c-.97.66-2.23 1.05-3.68 1.05-2.83 0-5.23-1.9-6.09-4.48H2.27v2.82A11 11 0 0 0 12 23Z"/><path fill="#FBBC05" d="M5.91 14.21a6.6 6.6 0 0 1 0-4.21V7.18H2.27a11 11 0 0 0 0 9.85l3.64-2.82Z"/><path fill="#EA4335" d="M12 5.5c1.6 0 3.03.55 4.16 1.62l3.12-3.12A11 11 0 0 0 12 1 11 11 0 0 0 2.27 7.18l3.64 2.82C6.77 7.42 9.17 5.5 12 5.5Z"/></svg>
+        Google
+      </button>
+      <button class="btn-outline" style="flex:1;" type="button">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M16.36 12.78c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.73-1.36-.14-2.65.8-3.34.8-.68 0-1.74-.78-2.86-.76-1.47.02-2.83.85-3.58 2.16-1.53 2.65-.39 6.57 1.1 8.72.73 1.05 1.6 2.23 2.74 2.19 1.1-.05 1.51-.71 2.84-.71 1.32 0 1.7.71 2.86.69 1.18-.02 1.93-1.07 2.65-2.13.84-1.22 1.18-2.4 1.2-2.46-.03-.01-2.29-.88-2.31-3.48ZM14.2 6.1c.6-.74 1.01-1.76.9-2.78-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.69-.92 2.68.97.08 1.97-.49 2.58-1.21Z"/></svg>
+        Apple
+      </button>
+    </div>
+
+    <div style="margin-top:15px; display:flex; align-items:center; justify-content:center; gap:6px;">
+      <span style="font-size:12px; color:var(--text-secondary);">Nog geen account?</span>
+      <span class="link" style="font-size:12px; font-weight:600;">Account aanmaken</span>
+    </div>
+  </div>
+
+  <!-- ===================== B2. VERIFICATION CODE (2FA) ===================== -->
+  <div class="screen" id="screen-code">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg width="23" height="23" viewBox="0 0 24 24" fill="none"><path d="M12 2.6 20.2 7v10L12 21.4 3.8 17V7L12 2.6Z" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/><path d="M3.9 7.1 12 11.8l8.1-4.7M12 11.8v9.4" stroke="#fff" stroke-width="1.7" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:3px;">
+        <span class="brand-title">Bambu Lab account</span>
+        <span class="brand-sub">Meld je aan om je printer te beheren</span>
+      </div>
+    </div>
+
+    <div style="margin-top:15px; text-align:center;">
+      <span style="font-size:12.5px; line-height:1.45; color:var(--text-secondary);">Voer de 6-cijferige verificatiecode in die we naar <span style="color:var(--text-primary); font-weight:600;" id="code-email">je e-mailadres</span> hebben gestuurd.</span>
+    </div>
+
+    <input class="field code-field" id="input-code" inputmode="numeric" maxlength="6" placeholder="000000" style="margin-top:14px;" />
+
+    <button class="btn-primary" id="btn-verify" style="margin-top:13px;" type="button">Verifi&euml;ren</button>
+
+    <div style="margin-top:13px; display:flex; align-items:center; justify-content:center; gap:14px;">
+      <span class="link-muted" id="btn-back" style="font-size:12px;">Terug</span>
+      <span class="link" id="btn-resend" style="font-size:12px; font-weight:600;">Code opnieuw versturen</span>
+    </div>
+  </div>
+
+  <!-- ===================== B3. SELECT PRINTER ===================== -->
+  <div class="screen" id="screen-select">
+    <div style="display:flex; align-items:center; gap:8px;">
+      <span style="font-size:15px; font-weight:600; color:var(--text-primary);">Selecteer printer</span>
+      <span style="font-size:12px; color:var(--text-secondary);">&middot; <span id="select-count">0</span> gekoppeld</span>
+    </div>
+    <span style="display:block; margin-top:3px; font-size:12px; color:var(--text-secondary);">Kies welke printer in de systray wordt weergegeven.</span>
+
+    <div style="margin-top:13px; display:flex; flex-direction:column; gap:8px;" id="printer-list"></div>
+
+    <div style="margin-top:13px; display:flex; align-items:center; justify-content:center;">
+      <span class="link-muted" id="btn-logout" style="font-size:12px;">Uitloggen</span>
+    </div>
+  </div>
+
+  <!-- shared error banner (below whichever screen is active) -->
+  <div class="error-banner" id="error-banner"></div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- current view state (the page's own copy; Python is the source of truth) ----
+  var current = {
+    loggedIn: false,
+    authStep: "login",   // "login" | "code" | "select"
+    status: "idle"       // drives which control command to send
+  };
+
+  // ---- status -> Dutch label + token color for the progress panel ----
+  var STATUS_LABELS = {
+    printing: "Bezig met printen",
+    paused: "Gepauzeerd",
+    done: "Voltooid",
+    error: "Gestopt",
+    idle: "Inactief"
+  };
+  var STATUS_VARS = {
+    printing: "var(--status-printing)",
+    paused: "var(--status-paused)",
+    done: "var(--status-done)",
+    error: "var(--status-error)",
+    idle: "var(--status-offline)"
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  function hasApi() {
+    return !!(window.pywebview && window.pywebview.api);
+  }
+
+  function showScreen(id) {
+    var ids = ["screen-progress", "screen-login", "screen-code", "screen-select"];
+    for (var i = 0; i < ids.length; i++) {
+      var el = $(ids[i]);
+      if (el) { el.classList.toggle("active", ids[i] === id); }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Python -> page entry points (called via window.evaluate_js).
+  // -------------------------------------------------------------------------
+
+  function applyTheme(theme) {
+    var t = (theme === "light") ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  }
+
+  function applyAuthStep(step) {
+    current.authStep = step;
+    if (current.loggedIn) {
+      showScreen("screen-progress");
+      return;
+    }
+    if (step === "code") { showScreen("screen-code"); }
+    else if (step === "select") { showScreen("screen-select"); }
+    else { showScreen("screen-login"); }
+  }
+
+  function applyError(msg) {
+    var banner = $("error-banner");
+    if (!banner) { return; }
+    if (msg === null || msg === undefined || msg === "") {
+      banner.textContent = "";
+      banner.classList.remove("visible");
+    } else {
+      banner.textContent = String(msg);
+      banner.classList.add("visible");
+    }
+  }
+
+  function applyDevices(list) {
+    var container = $("printer-list");
+    if (!container) { return; }
+    container.innerHTML = "";
+    var devices = Array.isArray(list) ? list : [];
+    $("select-count").textContent = String(devices.length);
+
+    devices.forEach(function (dev) {
+      var row = document.createElement("div");
+      row.className = "printer-row";
+
+      var tile = document.createElement("div");
+      tile.className = "printer-tile";
+      tile.innerHTML = '<svg width="19" height="19" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="4.5" width="15" height="15" rx="2.4" stroke="currentColor" stroke-width="1.6"/><rect x="8" y="8" width="8" height="8" rx="1.2" stroke="currentColor" stroke-width="1.6"/></svg>';
+
+      var mid = document.createElement("div");
+      mid.style.cssText = "flex:1; display:flex; flex-direction:column; gap:2px;";
+
+      var name = document.createElement("span");
+      name.style.cssText = "font-size:13.5px; font-weight:600; color:var(--text-primary);";
+      name.textContent = dev.name || dev.model || dev.id || "Printer";
+
+      var statusLine = document.createElement("span");
+      var statusColor = dev.statusColor || "var(--status-offline)";
+      statusLine.style.cssText = "display:flex; align-items:center; gap:6px; font-size:11.5px; color:" + statusColor + ";";
+      var dot = document.createElement("span");
+      dot.style.cssText = "width:6px; height:6px; border-radius:99px; background:" + statusColor + ";";
+      statusLine.appendChild(dot);
+      statusLine.appendChild(document.createTextNode(" " + (dev.statusLabel || "")));
+
+      mid.appendChild(name);
+      mid.appendChild(statusLine);
+
+      var chevron = document.createElement("span");
+      chevron.innerHTML = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" style="color:var(--text-secondary);"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+      row.appendChild(tile);
+      row.appendChild(mid);
+      row.appendChild(chevron);
+
+      row.addEventListener("click", function () {
+        if (hasApi()) { window.pywebview.api.select_printer(dev.id); }
+      });
+
+      container.appendChild(row);
+    });
+  }
+
+  function applyState(state) {
+    state = state || {};
+    current.loggedIn = !!state.loggedIn;
+    if (state.status) { current.status = state.status; }
+    if (state.authStep) { current.authStep = state.authStep; }
+
+    if (state.theme) { applyTheme(state.theme); }
+
+    if (!current.loggedIn) {
+      // logged out -> show the auth step (login/code/select)
+      applyAuthStep(current.authStep || "login");
+      return;
+    }
+
+    // ----- logged-in progress panel -----
+    showScreen("screen-progress");
+
+    var status = state.status || "idle";
+    var color = STATUS_VARS[status] || STATUS_VARS.idle;
+    var label = STATUS_LABELS[status] || STATUS_LABELS.idle;
+    var printing = (status === "printing");
+
+    $("pp-name").textContent = state.printerName || "Printer";
+    $("pp-tile").style.color = color;
+
+    var statusLabelEl = $("pp-status-label");
+    statusLabelEl.textContent = label;
+    $("pp-status-line").style.color = color;
+
+    var dot = $("pp-status-dot");
+    dot.style.background = color;
+    dot.style.animation = printing ? "tbBlink 1.4s ease-in-out infinite" : "none";
+
+    var pct = Math.max(0, Math.min(100, Number(state.pct) || 0));
+    $("pp-pct").textContent = String(Math.round(pct));
+
+    var bar = $("pp-bar");
+    bar.style.width = pct + "%";
+    bar.style.background = color;
+    $("pp-sheen").style.animation = printing ? "tbShim 1.6s linear infinite" : "none";
+
+    $("pp-eta").textContent = state.etaLabel || "";
+
+    var file = state.file || "bestand";
+    var layer = (state.layer !== undefined && state.layer !== null) ? state.layer : 0;
+    var totalLayer = (state.totalLayer !== undefined && state.totalLayer !== null) ? state.totalLayer : 0;
+    $("pp-caption").textContent = file + " · laag " + layer + "/" + totalLayer;
+
+    $("pp-nozzle").textContent = String(Math.round(Number(state.nozzle) || 0));
+    $("pp-nozzle-target").textContent = String(Math.round(Number(state.nozzleTarget) || 0));
+    $("pp-bed").textContent = String(Math.round(Number(state.bed) || 0));
+    $("pp-bed-target").textContent = String(Math.round(Number(state.bedTarget) || 0));
+
+    // stateful primary control label
+    var primaryLabel = (status === "printing") ? "Pauzeren"
+      : (status === "paused") ? "Hervatten"
+      : "Opnieuw printen";
+    $("btn-control-primary").textContent = primaryLabel;
+    $("btn-control-primary").style.background = color;
+  }
+
+  // expose Python -> page entry points
+  window.applyState = applyState;
+  window.applyTheme = applyTheme;
+  window.applyAuthStep = applyAuthStep;
+  window.applyDevices = applyDevices;
+  window.applyError = applyError;
+
+  // -------------------------------------------------------------------------
+  // page -> Python actions (window.pywebview.api.*), each guarded.
+  // -------------------------------------------------------------------------
+
+  function wire() {
+    // login
+    $("btn-login").addEventListener("click", function () {
+      if (!hasApi()) { return; }
+      var email = $("input-email").value;
+      var password = $("input-password").value;
+      window.pywebview.api.login_submit(email, password);
+      // never echo/persist the password in the DOM
+      $("input-password").value = "";
+    });
+
+    // code step
+    $("input-code").addEventListener("input", function (e) {
+      e.target.value = e.target.value.replace(/[^0-9]/g, "").slice(0, 6);
+    });
+    $("btn-verify").addEventListener("click", function () {
+      if (hasApi()) { window.pywebview.api.submit_code($("input-code").value); }
+    });
+    $("btn-resend").addEventListener("click", function () {
+      if (hasApi()) { window.pywebview.api.resend_code(); }
+    });
+    $("btn-back").addEventListener("click", function () {
+      // local nav back to the credentials step (no backend call needed)
+      applyAuthStep("login");
+    });
+
+    // select-printer
+    $("btn-logout").addEventListener("click", function () {
+      if (hasApi()) { window.pywebview.api.logout(); }
+    });
+
+    // progress panel: gear returns to printer selection.
+    // For THIS phase the gear is a harmless local nav to the select screen;
+    // Phase 8 wires real navigation/session handling.
+    $("btn-gear").addEventListener("click", function () {
+      current.loggedIn = false;
+      applyAuthStep("select");
+    });
+
+    // controls -> control(command)
+    $("btn-control-primary").addEventListener("click", function () {
+      if (!hasApi()) { return; }
+      var cmd = (current.status === "printing") ? "pause" : "resume";
+      window.pywebview.api.control(cmd);
+    });
+    $("btn-control-cancel").addEventListener("click", function () {
+      if (hasApi()) { window.pywebview.api.control("stop"); }
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // lifecycle: pull initial state when the bridge is ready; hide on blur.
+  // -------------------------------------------------------------------------
+
+  window.addEventListener("pywebviewready", function () {
+    if (!hasApi()) { return; }
+    var result = window.pywebview.api.get_initial_state();
+    if (result && typeof result.then === "function") {
+      result.then(function (state) {
+        if (state && state.theme) { applyTheme(state.theme); }
+        applyState(state);
+      });
+    } else {
+      if (result && result.theme) { applyTheme(result.theme); }
+      applyState(result);
+    }
+  });
+
+  // click-away hide (CONTEXT LOCKED): losing focus hides the flyout.
+  window.addEventListener('blur', function () {
+    if (hasApi()) { window.pywebview.api.hide(); }
+  });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", function () { wire(); showScreen("screen-login"); });
+  } else {
+    wire();
+    showScreen("screen-login");
+  }
+})();
+</script>
+</body>
+</html>
