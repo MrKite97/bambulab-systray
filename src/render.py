@@ -16,10 +16,9 @@ can ever reach the tooltip/icon, and nothing here logs.
 5-state machine (offline / disconnected / token-expired) is Phase 3.
 """
 
-import os
-
 from PIL import Image, ImageDraw, ImageFont
 
+from src.paths import resource_path
 from src.state import PrintState, hmm
 
 ACTIVE_STATES = {"RUNNING", "PAUSE"}
@@ -65,7 +64,7 @@ def tooltip_text(state: PrintState) -> str:
 
 ICON_SIZE = 64
 _ICON_FONT_SIZE = 34
-_FONT_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "DejaVuSans.ttf")
+_FONT_PATH = resource_path("assets/DejaVuSans.ttf")
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
