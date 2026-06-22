@@ -351,3 +351,134 @@ def test_controller_logs_no_secret(caplog):
     assert "SECRET_PASSWORD_123" not in text
     assert "SECRET_TOKEN_XYZ" not in text
     assert "987654" not in text
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: _enter_logged_in device fetch / 401 / select_printer / bootstrap     #
+# --------------------------------------------------------------------------- #
+
+
+def _http_error(status):
+    """Build a requests.HTTPError carrying a response with ``status`` code."""
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = status
+    err = requests.HTTPError(f"{status} error")
+    err.response = resp
+    return err
+
+
+def test_enter_logged_in_fetches_enriches_and_pushes_select():
+    auth = FakeAuth(
+        login_result={"accessToken": "tok"},
+        devices=[{"dev_id": "D1", "name": "X1", "dev_model_name": "X1C", "online": True}],
+    )
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c.login_submit("a@b.c", "pw")
+    assert auth.method_calls("get_device_list") == [("tok",)]
+    assert auth.called("enrich_devices")
+    pushed = fly.payloads("push_devices")
+    assert pushed and pushed[0][0]["id"] == "D1"
+    assert fly.steps()[-1] == "select"
+
+
+def test_enter_logged_in_401_clears_token_and_returns_to_login():
+    auth = FakeAuth(
+        login_result={"accessToken": "tok"},
+        devices_exc=_http_error(401),
+    )
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c.login_submit("a@b.c", "pw")
+    assert ts.cleared == 1
+    assert fly.steps()[-1] == "login"
+    assert fly.errors()
+
+
+def test_enter_logged_in_non_401_pushes_error_keeps_token():
+    auth = FakeAuth(
+        login_result={"accessToken": "tok"},
+        devices_exc=_http_error(500),
+    )
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c.login_submit("a@b.c", "pw")
+    assert ts.cleared == 0
+    assert fly.errors()
+    assert "select" not in fly.steps()
+
+
+def test_select_printer_persists_serial_region_preserved_and_starts_mqtt():
+    auth = FakeAuth(
+        login_result={"accessToken": "tok"},
+        devices=[{"dev_id": "DEV123", "name": "X1", "online": True}],
+    )
+    settings = FakeSettings({"region": "eu", "serial": None})
+    c, auth, ts, st, fly = _make_controller(auth=auth, settings=settings)
+    c.login_submit("a@b.c", "pw")
+    c.select_printer("DEV123")
+    assert settings.saved[-1] == {"region": "eu", "serial": "DEV123"}
+    assert c._test_start_calls == [("tok", "DEV123")]
+    # progress state pushed, logged in
+    states = fly.payloads("push_state")
+    assert states and states[-1]["loggedIn"] is True
+
+
+def test_select_printer_without_token_returns_to_login_no_mqtt():
+    c, auth, ts, st, fly = _make_controller()
+    c.select_printer("DEV123")
+    assert c._test_start_calls == []
+    assert fly.steps()[-1] == "login"
+
+
+def test_bootstrap_from_stored_valid_token_starts_mqtt():
+    auth = FakeAuth(login_result={}, devices=[{"dev_id": "D1", "online": True}])
+    ts = FakeTokenStore(token="stored-tok")
+    settings = FakeSettings({"region": "global", "serial": "D1"})
+    c, auth, ts, st, fly = _make_controller(auth=auth, token_store=ts, settings=settings)
+    result = c.bootstrap_from_stored()
+    assert result is True
+    assert c._test_start_calls == [("stored-tok", "D1")]
+    states = fly.payloads("push_state")
+    assert states and states[-1]["loggedIn"] is True
+
+
+def test_bootstrap_from_stored_401_returns_to_login():
+    auth = FakeAuth(devices_exc=_http_error(401))
+    ts = FakeTokenStore(token="stale-tok")
+    settings = FakeSettings({"region": "global", "serial": "D1"})
+    c, auth, ts, st, fly = _make_controller(auth=auth, token_store=ts, settings=settings)
+    result = c.bootstrap_from_stored()
+    assert result is True
+    assert ts.cleared == 1
+    assert fly.steps()[-1] == "login"
+    assert c._test_start_calls == []
+
+
+def test_bootstrap_from_stored_no_token_goes_to_login():
+    ts = FakeTokenStore(token=None)
+    settings = FakeSettings({"region": "global", "serial": "D1"})
+    c, auth, ts, st, fly = _make_controller(token_store=ts, settings=settings)
+    result = c.bootstrap_from_stored()
+    assert result is False
+    assert fly.steps() == ["login"]
+    assert c._test_start_calls == []
+
+
+def test_bootstrap_from_stored_no_serial_goes_to_login():
+    ts = FakeTokenStore(token="tok")
+    settings = FakeSettings({"region": "global", "serial": None})
+    c, auth, ts, st, fly = _make_controller(token_store=ts, settings=settings)
+    result = c.bootstrap_from_stored()
+    assert result is False
+    assert fly.steps() == ["login"]
+
+
+def test_no_push_payload_contains_token_in_select_or_bootstrap():
+    auth = FakeAuth(
+        login_result={"accessToken": "SECRET_TOK_999"},
+        devices=[{"dev_id": "D1", "name": "X1", "online": True}],
+    )
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c.login_submit("a@b.c", "pw")
+    c.select_printer("D1")
+    assert "SECRET_TOK_999" not in fly.all_payloads_json()
