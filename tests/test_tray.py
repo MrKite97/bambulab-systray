@@ -415,3 +415,28 @@ def test_unchanged_display_debounces():
 
     assert icon.icon_set_count == 1
     assert icon.title == "Verbinden…"
+
+
+# --- Plan 07-03: hidden default left-click flyout-toggle item ----------------
+
+
+def test_make_open_item_is_hidden_default():
+    """make_open_item returns a pystray MenuItem flagged default=True (LEFT-click
+    invokes it) and visible=False (kept out of the right-click menu)."""
+    item = tray.make_open_item(lambda: None)
+
+    assert item.default is True
+    assert item.visible is False
+
+
+def test_make_open_item_callback_invokes_toggle_once():
+    """Invoking the item's callback (as pystray does, with icon+item) calls the
+    injected zero-arg toggle exactly once."""
+    calls = []
+    item = tray.make_open_item(lambda: calls.append(True))
+
+    # pystray invokes a selected menu item as item(icon); it then forwards to the
+    # wrapped action as action(icon, item) internally.
+    item(object())
+
+    assert calls == [True]

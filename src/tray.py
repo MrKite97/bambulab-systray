@@ -36,6 +36,29 @@ import time
 from src import render, status
 
 
+def make_open_item(toggle):
+    """Build the hidden default LEFT-click menu item that toggles the flyout.
+
+    On Windows pystray, a ``MenuItem(..., default=True)`` is invoked by a LEFT
+    click on the tray icon, and ``visible=False`` keeps it OUT of the right-click
+    menu (so the existing Afsluiten / autostart / re-login items are unchanged).
+    The label "Open" is therefore never shown.
+
+    ``toggle`` is a zero-arg callable (the bound ``FlyoutWindow.toggle`` wired in
+    app.py). The returned item's callback simply invokes it -- it does NOT mutate
+    the icon off-thread, so the locked marshalling boundary stays intact. The
+    ``pystray`` import is local so importing this module needs no GUI backend.
+    """
+    import pystray
+
+    return pystray.MenuItem(
+        "Open",
+        lambda icon, item: toggle(),
+        default=True,
+        visible=False,
+    )
+
+
 class TrayController:
     """Bridges PrintState (written by the network thread) to a pystray Icon
     (owned by the UI thread). Marshals via a thread-safe queue and debounces
