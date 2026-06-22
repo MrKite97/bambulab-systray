@@ -20,6 +20,8 @@ import threading
 
 from src import app
 from src.state import PrintState
+from src.status import ConnectionStatus, DisplayState
+from src.tray import TrayController
 
 
 class CallRecorder:
@@ -69,13 +71,19 @@ class FakeClient:
 
 
 class FakeController:
-    """Records on_state_change calls (the producer-side signal)."""
+    """Records on_state_change calls (the producer-side signal) and every
+    connection-status enqueue (so the status transitions can be asserted without
+    a real icon or pump)."""
 
     def __init__(self):
         self.signal_count = 0
+        self.statuses = []
 
     def on_state_change(self):
         self.signal_count += 1
+
+    def set_connection_status(self, status_value):
+        self.statuses.append(status_value)
 
 
 class FakeMsg:
@@ -253,3 +261,144 @@ def test_build_app_does_not_log_token(monkeypatch, caplog):
 
     assert "SUPERSECRETSIG" not in caplog.text
     assert token not in caplog.text
+
+
+# --- Status transitions (connect / disconnect / 401) ------------------------
+
+
+class FakeClock:
+    """An injectable monotonic clock the tests advance by hand (no real waits)."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def test_on_connect_wrapper_sets_connected_status():
+    """The wrapped on_connect calls mqtt_client.on_connect AND enqueues a
+    CONNECTED status transition (network-thread enqueue, never icon mutation)."""
+    controller = FakeController()
+    on_connect = app.make_on_connect(controller)
+
+    # Drive the wrapped callback with the same signature paho v2 uses; userdata
+    # carries the serial the inner mqtt_client.on_connect subscribes/pushes for.
+    class FakeClientCb:
+        def __init__(self):
+            self.subscribed = []
+            self.published = []
+
+        def subscribe(self, topic):
+            self.subscribed.append(topic)
+
+        def publish(self, topic, payload):
+            self.published.append((topic, payload))
+
+    client = FakeClientCb()
+    on_connect(client, {"serial": "SER"}, None, 0, None)
+
+    assert client.subscribed == ["device/SER/report"]  # inner on_connect ran
+    assert controller.statuses == [ConnectionStatus.CONNECTED]
+
+
+def test_on_disconnect_wrapper_sets_disconnected_status():
+    """The wrapped on_disconnect calls the inert mqtt_client.on_disconnect AND
+    enqueues a DISCONNECTED status transition."""
+    controller = FakeController()
+    on_disconnect = app.make_on_disconnect(controller)
+
+    on_disconnect(client=None, userdata=None, disconnect_flags=None, reason_code=0, properties=None)
+
+    assert controller.statuses == [ConnectionStatus.DISCONNECTED]
+
+
+def test_auth_failure_sets_token_expired_status():
+    """A 401/auth rejection on connect (detected via spike._auth_failed) sets
+    ConnectionStatus.TOKEN_EXPIRED before the re-login path runs -- and the
+    connect wrapper still drives mqtt_client.run_session's backoff (no new loop:
+    it raises StopSession to hand control back to run_session)."""
+    controller = FakeController()
+    relogin_calls = []
+
+    def fake_relogin():
+        relogin_calls.append(True)
+
+    # An inner connect that raises an auth-equivalent error (paho phrasing).
+    def failing_connect(client):
+        raise RuntimeError("Connection Refused: not authorized.")
+
+    wrapped = app.make_status_connect(
+        controller, failing_connect, on_auth_fail=fake_relogin
+    )
+
+    # The wrapper must detect the auth failure, flag TOKEN_EXPIRED, run the
+    # re-login hook, then re-raise so run_session keeps owning the loop/backoff.
+    import pytest
+
+    with pytest.raises(Exception):
+        wrapped(client=None)
+
+    assert ConnectionStatus.TOKEN_EXPIRED in controller.statuses
+    assert relogin_calls == [True]
+
+
+def test_non_auth_failure_does_not_set_token_expired():
+    """A transient (non-auth) connect failure must NOT flag TOKEN_EXPIRED -- it
+    just propagates so run_session backs off and retries."""
+    controller = FakeController()
+
+    def failing_connect(client):
+        raise RuntimeError("Connection timed out")
+
+    wrapped = app.make_status_connect(controller, failing_connect, on_auth_fail=lambda: None)
+
+    import pytest
+
+    with pytest.raises(Exception):
+        wrapped(client=None)
+
+    assert ConnectionStatus.TOKEN_EXPIRED not in controller.statuses
+
+
+def test_freshness_pump_tick_flips_to_offline():
+    """A pump tick AFTER advancing the injected clock past FRESHNESS_TIMEOUT_SECONDS
+    flips an idle-but-stale stream to the 'Printer offline' tooltip WITHOUT a new
+    MQTT message -- the freshness watcher rides the existing pump."""
+    from src import status
+
+    clock = FakeClock(now=1000.0)
+    icon = FakeIcon()
+    state = PrintState()
+    controller = TrayController(icon, state, now=clock)
+
+    # Simulate a fresh idle report just arrived (connected, gcode_state idle).
+    controller.set_connection_status(ConnectionStatus.CONNECTED)
+    state.gcode_state = "IDLE"
+    state.last_update_monotonic = clock.now  # fresh as of "now"
+    controller.on_state_change()
+    controller.pump_once()
+    assert icon.title == status.TOOLTIP_NO_ACTIVE_PRINT  # idle, not offline
+
+    # No new message arrives; time passes beyond the freshness window.
+    clock.advance(status.FRESHNESS_TIMEOUT_SECONDS + 1)
+
+    # A bare pump tick (the watcher) must now repaint to "Printer offline".
+    controller.on_state_change()  # the watcher re-enqueues the derived key
+    controller.pump_once()
+    assert icon.title == status.TOOLTIP_PRINTER_OFFLINE
+
+
+def test_build_app_injects_clock_into_controller(monkeypatch):
+    """build_app accepts an injectable monotonic clock and threads it into the
+    TrayController so freshness is driveable in tests (no real waits)."""
+    _patch_build_app(monkeypatch)
+    clock = FakeClock(now=500.0)
+
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG", now=clock)
+
+    # The controller derives freshness from the injected clock.
+    assert result["controller"]._now is clock
