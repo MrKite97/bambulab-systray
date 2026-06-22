@@ -7,12 +7,18 @@ tooltip. No network, no threads, no real waits -- the freshness clock is
 injected as a plain float, mirroring tests/test_render.py's style.
 """
 
+from src.render import tooltip_text
 from src.state import PrintState
 from src.status import (
     FRESHNESS_TIMEOUT_SECONDS,
+    TOOLTIP_CLOUD_DISCONNECTED,
+    TOOLTIP_NO_ACTIVE_PRINT,
+    TOOLTIP_PRINTER_OFFLINE,
+    TOOLTIP_TOKEN_EXPIRED,
     ConnectionStatus,
     DisplayState,
     derive_display_state,
+    tooltip_for,
 )
 
 # A fixed "now" on the injected monotonic clock; all timestamps are relative.
@@ -173,3 +179,92 @@ def test_connection_status_has_exactly_three_members():
 
 def test_freshness_timeout_is_thirty():
     assert FRESHNESS_TIMEOUT_SECONDS == 30
+
+
+# --- tooltip_for: exact locked Dutch string per state ----------------------
+
+
+def test_tooltip_active_print_delegates_to_render():
+    """ACTIVE_PRINT tooltip is single-sourced from render.tooltip_text."""
+    st = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    assert tooltip_for(DisplayState.ACTIVE_PRINT, st) == tooltip_text(st)
+    assert tooltip_for(DisplayState.ACTIVE_PRINT, st) == "47% — nog 1u 23m"
+
+
+def test_tooltip_no_active_print():
+    assert (
+        tooltip_for(DisplayState.NO_ACTIVE_PRINT, _state(gcode_state="IDLE"))
+        == "Geen actieve print"
+        == TOOLTIP_NO_ACTIVE_PRINT
+    )
+
+
+def test_tooltip_printer_offline():
+    assert (
+        tooltip_for(DisplayState.PRINTER_OFFLINE, _state(gcode_state="IDLE"))
+        == "Printer offline"
+        == TOOLTIP_PRINTER_OFFLINE
+    )
+
+
+def test_tooltip_cloud_disconnected():
+    """Single-character ellipsis U+2026, not three dots."""
+    result = tooltip_for(DisplayState.CLOUD_DISCONNECTED, _state())
+    assert result == "Verbinden…" == TOOLTIP_CLOUD_DISCONNECTED
+    assert "..." not in result  # not three ASCII dots
+    assert "…" in result  # the single ellipsis char
+
+
+def test_tooltip_token_expired():
+    assert (
+        tooltip_for(DisplayState.TOKEN_EXPIRED, _state())
+        == "Opnieuw inloggen vereist"
+        == TOOLTIP_TOKEN_EXPIRED
+    )
+
+
+def test_all_five_tooltips_are_distinct():
+    """Each of the 5 states yields a distinct tooltip string."""
+    st = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    tips = {tooltip_for(ds, st) for ds in DisplayState}
+    assert len(tips) == 5
+
+
+def test_transitions_clear_stale_numbers():
+    """A state that WAS active (47%, 83m) but is derived non-active leaks no numbers.
+
+    Every non-ACTIVE_PRINT tooltip must contain no '%' and no 'nog ' so leftover
+    percent/remaining-time fields never surface.
+    """
+    was_active = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    for ds in (
+        DisplayState.NO_ACTIVE_PRINT,
+        DisplayState.PRINTER_OFFLINE,
+        DisplayState.CLOUD_DISCONNECTED,
+        DisplayState.TOKEN_EXPIRED,
+    ):
+        tip = tooltip_for(ds, was_active)
+        assert "%" not in tip, f"{ds.name} leaked a percent: {tip!r}"
+        assert "nog " not in tip, f"{ds.name} leaked remaining time: {tip!r}"
+        assert "47" not in tip, f"{ds.name} leaked the 47% number: {tip!r}"
+
+
+def test_full_table_derive_then_tooltip():
+    """End-to-end: each connection/state scenario derives + renders its tooltip."""
+    fresh_idle = _state(gcode_state="IDLE", last_update_monotonic=NOW)
+    active = _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+    stale_idle = _state(
+        gcode_state="IDLE",
+        last_update_monotonic=NOW - (FRESHNESS_TIMEOUT_SECONDS + 1),
+    )
+
+    cases = [
+        (active, ConnectionStatus.CONNECTED, "47% — nog 1u 23m"),
+        (fresh_idle, ConnectionStatus.CONNECTED, "Geen actieve print"),
+        (stale_idle, ConnectionStatus.CONNECTED, "Printer offline"),
+        (active, ConnectionStatus.DISCONNECTED, "Verbinden…"),
+        (active, ConnectionStatus.TOKEN_EXPIRED, "Opnieuw inloggen vereist"),
+    ]
+    for st, conn, expected in cases:
+        ds = derive_display_state(st, conn, NOW)
+        assert tooltip_for(ds, st) == expected
