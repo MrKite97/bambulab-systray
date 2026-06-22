@@ -254,6 +254,12 @@ class _ReloginHandler:
         TrayController exists so the menu can reference it)."""
         self._controller = controller
 
+    def bind_client(self, client):
+        """Late-bind the live MQTT client (Plan 08-02 deferred-MQTT path builds
+        the handler before any client exists; start_mqtt binds it once a session
+        starts so the menu/401 disconnect targets the running client)."""
+        self._client = client
+
     def __call__(self, icon=None, item=None):
         if self._controller is not None:
             # (1) visible "Opnieuw inloggen vereist" -- enqueue only, never icon.
@@ -264,11 +270,13 @@ class _ReloginHandler:
         #     The new token is persisted inside spike.get_access_token.
         self._get_token(force_relogin=True)
         # (4) drop the live session so the existing backoff reconnects with the
-        #     new token. Never raise out of a menu callback / teardown path.
-        try:
-            self._client.disconnect()
-        except Exception:  # noqa: BLE001 - teardown must not break the UI/auth path
-            logger.debug("client.disconnect() raised during re-login; continuing")
+        #     new token. Never raise out of a menu callback / teardown path. The
+        #     client may be None on the deferred path (no session started yet).
+        if self._client is not None:
+            try:
+                self._client.disconnect()
+            except Exception:  # noqa: BLE001 - teardown must not break the UI/auth path
+                logger.debug("client.disconnect() raised during re-login; continuing")
 
 
 def make_relogin_handler(client, shutdown_event, *, get_token, controller=None):
@@ -329,50 +337,87 @@ def make_connect(shutdown_event):
     return _connect
 
 
-# --- Phase 7 flyout/bridge wiring (stubs for THIS phase) -------------------- #
+# --- Phase 8 flyout/bridge wiring (real SessionController handlers) --------- #
 #
-# The bridge action handlers are deliberate STUBS this phase: a tray click must
-# open a themed panel and the JS<->Python round-trip must work, but real
-# auth/login (Phase 8) and live MQTT/control binding (Phase 9) are NOT wired
-# here (07-CONTEXT.md scope guard). Each stub logs ONLY the action NAME -- never
-# the email/password/code/command payload (T-07-02). serialize_state (Plan 02)
+# Phase 8 wires the panel auth/select actions to the REAL SessionController
+# (src.session). The five page actions (login_submit/submit_code/resend_code/
+# select_printer/logout) now drive the real auth/token_store/settings flow; only
+# ``control`` stays a stub this phase (Phase 9 wires it to control.py). The
+# SessionController is the single brain: it logs nothing sensitive and pushes only
+# secret-free state to the page (T-08-08). ``serialize_state`` (Plan 07-02)
 # guarantees the pushed state carries no secret.
 
-# The page-action method names the panel can call (mirrors bridge._METHODS minus
-# hide / get_initial_state, which are wired to real callables below).
-_STUB_ACTIONS = (
-    "login_submit",
-    "submit_code",
-    "resend_code",
-    "select_printer",
-    "logout",
-    "control",
-)
+# The page-action method names still served by a NAME-only stub. After Phase 8
+# only ``control`` remains a stub (the auth/select actions are real now).
+_STUB_ACTIONS = ("control",)
 
 
 def _make_stub_action(name):
     """Build a harmless page-action handler that logs only the action NAME.
 
-    Phases 8/9 replace these with the real auth/control handlers. The returned
+    Phase 9 replaces ``control`` with the real control handler. The returned
     callable accepts (and ignores) any args so the panel can pass a payload
-    (email/password/code/command) WITHOUT it ever being logged (T-07-02)."""
+    (command) WITHOUT it ever being logged (T-07-02)."""
 
     def _stub(*_args, **_kwargs):
-        # NEVER log *_args -- they may carry email/password/code/command values.
+        # NEVER log *_args -- they may carry a command value.
         logger.debug("bridge action: %s", name)
         return None
 
     return _stub
 
 
-def make_bridge_handlers(flyout):
-    """Build the js_api handler mapping for THIS phase.
+def make_session(
+    flyout,
+    *,
+    start_mqtt,
+    stop_session,
+    auth=auth,
+    token_store=token_store,
+    settings=settings_module,
+    run_async=None,
+):
+    """Construct the Plan 01 :class:`~src.session.SessionController` with the real
+    modules injected (the seam the bridge handlers + bootstrap call into).
 
-    ``hide`` is wired to the real ``flyout.hide`` (click-away / tray toggle); the
-    auth/control actions are safe stubs (see :func:`_make_stub_action`) that log
-    only the action name. The mapping is the seam Phases 8/9 plug real handlers
-    into."""
-    handlers = {"hide": flyout.hide}
+    ``start_mqtt(token, serial)`` and ``stop_session()`` are the deferred-MQTT
+    hooks (see :func:`make_start_mqtt` / :func:`make_stop_session`). ``auth`` /
+    ``token_store`` / ``settings`` default to the real modules but are injectable
+    for tests. ``run_async`` is forwarded only when provided so tests can run the
+    controller's worker bodies inline (its production default is a daemon thread).
+    Imported lazily so ``import src.app`` stays cheap and free of cycles."""
+    from src.session import SessionController
+
+    kwargs = {
+        "auth": auth,
+        "token_store": token_store,
+        "settings": settings,
+        "flyout": flyout,
+        "start_mqtt": start_mqtt,
+        "stop_session": stop_session,
+    }
+    if run_async is not None:
+        kwargs["run_async"] = run_async
+    return SessionController(**kwargs)
+
+
+def make_bridge_handlers(flyout, session):
+    """Build the js_api handler mapping wiring the panel to the SessionController.
+
+    ``hide`` stays the real ``flyout.hide`` (click-away / tray toggle); the five
+    auth/select actions forward to the injected ``session``'s BOUND methods
+    (login_submit/submit_code/resend_code/select_printer/logout) so the panel
+    drives the real auth flow; ``control`` stays a NAME-only stub until Phase 9.
+    Arguments (email/password/code) pass straight through -- nothing is logged
+    here (T-08-08)."""
+    handlers = {
+        "hide": flyout.hide,
+        "login_submit": session.login_submit,
+        "submit_code": session.submit_code,
+        "resend_code": session.resend_code,
+        "select_printer": session.select_printer,
+        "logout": session.logout,
+    }
     for name in _STUB_ACTIONS:
         handlers[name] = _make_stub_action(name)
     return handlers
@@ -394,6 +439,315 @@ def make_flyout_toggle(flyout):
         flyout.toggle()
 
     return _toggle
+
+
+def _wire_client(
+    token,
+    serial,
+    *,
+    state,
+    controller,
+    shutdown_event,
+    relogin_handler,
+    connect=None,
+    sleep=None,
+):
+    """Build + wire the MQTT client for ``(token, serial)`` and return
+    ``(client, network_runner)`` WITHOUT starting any thread.
+
+    This is the single place the client identity, userdata, callbacks, and the
+    status/401 connect wrapper are wired -- reused by both the eager
+    :func:`build_app` path and the deferred :func:`make_start_mqtt` hook so the
+    WHEN of starting the network thread can move without duplicating the HOW.
+    The token is never logged; only the serial (benign) is."""
+    if sleep is None:
+        sleep = time.sleep
+
+    username = auth.mqtt_username_from_token(token)
+    client = mqtt_client.build_client(
+        client_id=f"bambu-systray-{uuid4()}",
+        username=username,
+        access_token=token,
+    )
+    # userdata carries serial+state for the module callbacks; the on_message
+    # wrapper both merges AND signals the controller.
+    client.user_data_set({"serial": serial, "state": state})
+    client.on_connect = make_on_connect(controller)
+    client.on_message = make_on_message(controller)
+    client.on_disconnect = make_on_disconnect(controller)
+
+    if connect is None:
+        connect = make_connect(shutdown_event)
+    # Wrap connect so a 401/auth rejection flips the tray to TOKEN_EXPIRED and
+    # drives the SAME re-login routine as the menu -- run_session keeps owning
+    # the backoff (no second reconnect loop).
+    connect = make_status_connect(controller, connect, on_auth_fail=relogin_handler)
+
+    def network_runner():
+        """Run the single long-lived MQTT session (on the network thread)."""
+        try:
+            mqtt_client.run_session(client, connect=connect, sleep=sleep)
+        except Exception:  # noqa: BLE001 - never let the daemon thread crash loudly
+            logger.debug("network session ended with an exception", exc_info=False)
+
+    return client, network_runner
+
+
+def make_start_mqtt(
+    *,
+    state,
+    controller,
+    shutdown_event,
+    relogin_handler,
+    connect=None,
+    sleep=None,
+):
+    """Build the deferred ``start_mqtt(token, serial)`` hook (Plan 08-02).
+
+    The returned callable lazily builds the MQTT client + network_runner from
+    ``(token, serial)`` via :func:`_wire_client` and starts ONE daemon network
+    thread named "mqtt-network" -- the SAME thread main() used to start eagerly,
+    now started only once a token + serial exist (post-login/post-select). It is
+    IDEMPOTENT (T-08-09): repeated calls (login retries) never spawn a second
+    session. The built client is exposed as ``start_mqtt.client`` so
+    :func:`make_stop_session` can disconnect it on logout. The token is never
+    logged."""
+
+    def start_mqtt(token, serial):
+        if start_mqtt.started:
+            return  # idempotent: at most one network thread (T-08-09)
+        start_mqtt.started = True
+        # ``controller`` is read off the attribute so build_gui can late-bind it
+        # after the TrayController is constructed (avoids a construction cycle).
+        client, network_runner = _wire_client(
+            token,
+            serial,
+            state=state,
+            controller=start_mqtt.controller,
+            shutdown_event=shutdown_event,
+            relogin_handler=relogin_handler,
+            connect=connect,
+            sleep=sleep,
+        )
+        start_mqtt.client = client
+        # Bind the live client into the relogin routine so the menu/401 path can
+        # disconnect it (run_session then reconnects with the fresh token).
+        if hasattr(relogin_handler, "bind_client"):
+            relogin_handler.bind_client(client)
+        threading.Thread(
+            target=network_runner, name="mqtt-network", daemon=True
+        ).start()
+
+    start_mqtt.started = False
+    start_mqtt.client = None
+    start_mqtt.controller = controller  # late-bindable (build_gui sets it later)
+    return start_mqtt
+
+
+def make_stop_session(shutdown_event, start_mqtt):
+    """Build the ``stop_session()`` hook the SessionController calls on logout.
+
+    Sets the shutdown event (so the network loop ends) and best-effort
+    disconnects the live client built by ``start_mqtt`` so logout returns to a
+    clean logged-out state. Never raises -- teardown must not break the UI/auth
+    path."""
+
+    def stop_session():
+        shutdown_event.set()
+        client = getattr(start_mqtt, "client", None)
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                logger.debug("client.disconnect() raised during stop_session; ignoring")
+
+    return stop_session
+
+
+class _LazyClientProxy:
+    """A stand-in passed to :func:`make_quit_handler` on the token-less path.
+
+    The live MQTT client does not exist at GUI-build time (it is built later by
+    the deferred ``start_mqtt`` hook), so the Afsluiten handler is given this
+    proxy: its :meth:`disconnect` forwards to ``start_mqtt.client`` if a session
+    has started, and is a harmless no-op otherwise. This keeps the locked
+    deadlock-safe quit order intact whether or not a session is live."""
+
+    def __init__(self, start_mqtt):
+        self._start_mqtt = start_mqtt
+
+    def disconnect(self):
+        client = getattr(self._start_mqtt, "client", None)
+        if client is not None:
+            client.disconnect()
+
+
+def build_gui(
+    *,
+    now=time.monotonic,
+    get_token=None,
+    email=None,
+    password=None,
+    autostart_mod=autostart,
+    settings=settings_module,
+    webview=None,
+    connect=None,
+    sleep=None,
+):
+    """Compose the GUI/bridge/menu/controller WITHOUT a token (Plan 08-02).
+
+    This is the token-less seam ``main()`` builds first: it wires the flyout, the
+    real :class:`~src.session.SessionController`-backed bridge handlers, the
+    deferred ``start_mqtt``/``stop_session`` hooks, the menu (autostart toggle +
+    panel-driven re-login + Afsluiten), and the tray icon with the LOGGED-OUT
+    neutral glyph. NO MQTT client is built and NO network thread is started here
+    -- the network thread starts only once a token + serial exist, via the
+    returned ``start_mqtt`` hook (deferred MQTT start). Returns the wired pieces
+    incl. ``session``, ``start_mqtt``, ``stop_session``, ``relogin_handler``."""
+    if sleep is None:
+        sleep = time.sleep
+
+    # Single source of truth shared across the network and UI threads.
+    state = PrintState()
+    shutdown_event = threading.Event()
+
+    # --- bridge Api + single hidden flyout window (built token-less) ---------
+    # The Api's state_provider needs the controller (built after the icon); a
+    # late-bound holder fills it in once the controller exists.
+    _holder = {"controller": None}
+
+    def _state_provider():
+        ctrl = _holder["controller"]
+        connection = (
+            getattr(ctrl, "_status", ConnectionStatus.DISCONNECTED)
+            if ctrl is not None
+            else ConnectionStatus.DISCONNECTED
+        )
+        logged_in = getattr(ctrl, "_status", None) is not None and _holder.get("logged_in", False)
+        return bridge.serialize_state(
+            state,
+            connection,
+            logged_in=_holder.get("logged_in", False),
+            theme=render.detect_windows_theme(),
+        )
+
+    flyout = FlyoutWindow(None, webview=webview)
+
+    # The re-login routine the menu + the automatic 401 path converge on. On the
+    # token-less path it is built before any client and before the session; the
+    # client is late-bound by start_mqtt, the controller after the icon exists.
+    if get_token is None:
+        def get_token(*, force_relogin):
+            return spike.get_access_token(
+                email or "", password or "", force_relogin=force_relogin
+            )
+    relogin_handler = make_relogin_handler(
+        None, shutdown_event, get_token=get_token, controller=None
+    )
+
+    # Deferred MQTT hooks: start_mqtt builds the client + network thread once a
+    # token+serial exist; stop_session tears it down on logout.
+    start_mqtt = make_start_mqtt(
+        state=state,
+        controller=None,  # late-bound below once the controller exists
+        shutdown_event=shutdown_event,
+        relogin_handler=relogin_handler,
+        connect=connect,
+        sleep=sleep,
+    )
+    stop_session = make_stop_session(shutdown_event, start_mqtt)
+
+    # The real SessionController behind the panel auth/select actions.
+    session = make_session(
+        flyout,
+        start_mqtt=start_mqtt,
+        stop_session=stop_session,
+        auth=auth,
+        token_store=token_store,
+        settings=settings,
+    )
+
+    api = bridge.Api(
+        handlers=make_bridge_handlers(flyout, session),
+        state_provider=_state_provider,
+    )
+    flyout._api = api  # the js_api the window is created with (create() reads it)
+    flyout.create()  # create the single hidden window (no-op start; just builds it)
+    flyout_toggle = make_flyout_toggle(flyout)
+
+    # The relogin MENU item now drives the PANEL login (no console prompt): it
+    # clears the token + resets the panel to the login screen and shows it.
+    menu_relogin = make_panel_relogin(session, flyout, relogin_handler)
+
+    # Afsluiten destroys the window FIRST (unblocks webview.start on the main
+    # thread) THEN tears down network + tray -- the locked deadlock-safe order.
+    # The live client is built later, so the quit handler holds a lazy proxy.
+    quit_handler = make_quit_handler(
+        _LazyClientProxy(start_mqtt), shutdown_event, flyout=flyout
+    )
+
+    icon = pystray.Icon(
+        "bambu-systray",
+        # LOGGED-OUT neutral glyph until login completes (Plan 08-02).
+        icon=render.render_icon(None),
+        title=render.tooltip_text(state),  # "Geen actieve print"
+        menu=pystray.Menu(
+            make_open_item(flyout_toggle),
+            pystray.MenuItem(
+                AUTOSTART_LABEL,
+                make_autostart_toggle(autostart_mod),
+                checked=lambda item: (
+                    autostart.is_enabled()
+                    if autostart_mod is autostart
+                    else autostart_mod.is_enabled()
+                ),
+            ),
+            pystray.MenuItem(RELOGIN_LABEL, menu_relogin),
+            pystray.MenuItem(QUIT_LABEL, quit_handler),
+        ),
+    )
+
+    controller = TrayController(icon, state, now=now)
+    _holder["controller"] = controller
+    relogin_handler.bind_controller(controller)
+    # Late-bind the controller into the deferred MQTT hook (it needs the
+    # controller for the on_message/on_connect wrappers + 401 status).
+    start_mqtt.controller = controller
+
+    return {
+        "icon": icon,
+        "controller": controller,
+        "state": state,
+        "shutdown_event": shutdown_event,
+        "flyout": flyout,
+        "api": api,
+        "flyout_toggle": flyout_toggle,
+        "session": session,
+        "start_mqtt": start_mqtt,
+        "stop_session": stop_session,
+        "relogin_handler": relogin_handler,
+    }
+
+
+def make_panel_relogin(session, flyout, relogin_handler):
+    """Build the 'Opnieuw verbinden / inloggen' menu callback (Plan 08-02).
+
+    The re-login item now drives the PANEL login instead of a console prompt: it
+    flags TOKEN_EXPIRED (via the shared relogin_handler's controller) so the tray
+    shows "Opnieuw inloggen vereist", logs the session out (clears the token +
+    stops any running session + resets the panel to the login step), and shows
+    the flyout so the user can re-authenticate IN THE PANEL. It NEVER calls
+    ``input()``/``getpass``/``spike.get_access_token`` (T-08-06/T-08-07)."""
+
+    def _relogin(icon=None, item=None):
+        controller = getattr(relogin_handler, "_controller", None)
+        if controller is not None:
+            controller.set_connection_status(ConnectionStatus.TOKEN_EXPIRED)
+        session.logout()  # clear_token + stop_session + push_auth_step("login")
+        flyout.push_auth_step("login")
+        flyout.show()
+
+    return _relogin
 
 
 def build_app(
@@ -418,17 +772,42 @@ def build_app(
     they monkeypatch ``auth.*`` / ``mqtt_client.build_client`` so no real broker,
     login, or tray is ever touched. The token is never logged.
 
+    Plan 08-02: ``build_app`` is now the EAGER (token-known) convenience path on
+    top of the token-less :func:`build_gui` + deferred :func:`make_start_mqtt`
+    seam. It builds the GUI/bridge/menu via ``build_gui`` (real
+    SessionController-backed handlers), derives + persists the serial from the
+    token, and eagerly wires the MQTT client + ``network_runner`` (still WITHOUT
+    starting a thread). The menu's re-login item drives the PANEL login (no
+    console prompt); the automatic 401 path still uses the shared
+    ``_ReloginHandler``. The token is never logged.
+
     ``now`` is the injectable monotonic clock threaded into the TrayController so
     the freshness/offline watcher is driveable in tests with no real waits.
     ``get_token`` is the injectable re-login closure (defaults to a
-    ``spike.get_access_token`` binding) so the menu/401 re-login path runs
+    ``spike.get_access_token`` binding) so the automatic 401 re-login path runs
     without real stdin/network in tests.
     """
     if sleep is None:
         sleep = time.sleep
 
+    # Build the token-less GUI/bridge/menu/controller + deferred MQTT hooks.
+    gui = build_gui(
+        now=now,
+        get_token=get_token,
+        email=email,
+        password=password,
+        autostart_mod=autostart_mod,
+        settings=settings,
+        webview=webview,
+        connect=connect,
+        sleep=sleep,
+    )
+    controller = gui["controller"]
+    state = gui["state"]
+    shutdown_event = gui["shutdown_event"]
+    relogin_handler = gui["relogin_handler"]
+
     # Derive MQTT identity + serial exactly as spike.run_with_relogin does.
-    username = auth.mqtt_username_from_token(token)
     devices = auth.get_device_list(token)
     serial = auth.pick_serial(devices)
     logger.info("Using printer serial (dev_id): %s", serial)
@@ -438,138 +817,38 @@ def build_app(
     # (T-04-01); the existing region is preserved by loading first.
     persist_serial(serial, settings=settings)
 
-    # Single source of truth shared across the network and UI threads.
-    state = PrintState()
-
-    # Build the pystray Icon FIRST with a neutral initial frame so something is
-    # visible immediately; the controller then owns all later repaints.
-    shutdown_event = threading.Event()
-    client = mqtt_client.build_client(
-        client_id=f"bambu-systray-{uuid4()}",
-        username=username,
-        access_token=token,
+    # Eagerly wire the MQTT client + network_runner from (token, serial) using the
+    # SAME helper the deferred start_mqtt hook uses -- but DO NOT start a thread.
+    client, network_runner = _wire_client(
+        token,
+        serial,
+        state=state,
+        controller=controller,
+        shutdown_event=shutdown_event,
+        relogin_handler=relogin_handler,
+        connect=connect,
+        sleep=sleep,
     )
-
-    # --- Phase 7: bridge Api + single hidden flyout window -------------------
-    # Build the flyout (hidden) and the js_api BEFORE the menu so the tray's
-    # hidden default LEFT-click item can toggle it. The Api's state_provider needs
-    # the controller (built after the icon), so it reads it via a late-bound
-    # holder filled once the controller exists -- avoiding a construction cycle.
-    _holder = {"controller": None}
-
-    def _state_provider():
-        ctrl = _holder["controller"]
-        connection = (
-            getattr(ctrl, "_status", ConnectionStatus.DISCONNECTED)
-            if ctrl is not None
-            else ConnectionStatus.DISCONNECTED
-        )
-        return bridge.serialize_state(
-            state,
-            connection,
-            logged_in=True,
-            theme=render.detect_windows_theme(),
-        )
-
-    flyout = FlyoutWindow(None, webview=webview)
-    api = bridge.Api(
-        handlers=make_bridge_handlers(flyout), state_provider=_state_provider
-    )
-    flyout._api = api  # the js_api the window is created with (create() reads it)
-    flyout.create()  # create the single hidden window (no-op start; just builds it)
-    flyout_toggle = make_flyout_toggle(flyout)
-
-    # Afsluiten destroys the window FIRST (unblocks webview.start on the main
-    # thread) THEN tears down network + tray -- the locked deadlock-safe order.
-    quit_handler = make_quit_handler(client, shutdown_event, flyout=flyout)
-
-    # Default the re-login token source to a spike.get_access_token closure so the
-    # menu/401 path drives a FRESH verifyCode login (console verifyCode prompt is
-    # reused from Phase 1). Injected in tests so it runs with no real stdin.
-    if get_token is None:
-        def get_token(*, force_relogin):
-            return spike.get_access_token(
-                email or "", password or "", force_relogin=force_relogin
-            )
-
-    # The re-login routine BOTH the menu item and the automatic 401 path converge
-    # on. Clears the stale token first, then forces a fresh login (no silent
-    # refresh) and tears down the live session so run_session reconnects with the
-    # new token. Built before the menu so the menu item can reference it.
-    relogin_handler = make_relogin_handler(
-        client, shutdown_event, get_token=get_token, controller=None
-    )
-
-    icon = pystray.Icon(
-        "bambu-systray",
-        icon=render.render_icon(None),  # neutral icon until the first report
-        title=render.tooltip_text(state),  # "Geen actieve print"
-        # Items, in order: the checkable autostart toggle (APP-02), then the
-        # re-login item (REL-02), then Afsluiten. The autostart tick mirrors the
-        # live HKCU\Run state via the checked= lambda.
-        menu=pystray.Menu(
-            # Hidden default item: a LEFT-click toggles the flyout (FLY-01). It is
-            # visible=False so the right-click menu below is unchanged.
-            make_open_item(flyout_toggle),
-            pystray.MenuItem(
-                AUTOSTART_LABEL,
-                make_autostart_toggle(autostart_mod),
-                # The tick reflects the live HKCU\Run state. Default reads the real
-                # autostart.is_enabled(); a fake module is honored under test.
-                checked=lambda item: (
-                    autostart.is_enabled()
-                    if autostart_mod is autostart
-                    else autostart_mod.is_enabled()
-                ),
-            ),
-            pystray.MenuItem(RELOGIN_LABEL, relogin_handler),
-            pystray.MenuItem(QUIT_LABEL, quit_handler),
-        ),
-    )
-
-    # Inject the monotonic clock so the freshness/offline watcher is driveable.
-    controller = TrayController(icon, state, now=now)
-    # Late-bind the controller into the bridge's state_provider so get_initial_state
-    # reports the live connection status the moment the panel opens.
-    _holder["controller"] = controller
-    # The re-login routine needs the controller to flag TOKEN_EXPIRED; wire it now
-    # that the controller exists (the menu callback closes over this same object).
-    relogin_handler.bind_controller(controller)
-
-    # Wire the client: userdata carries serial+state for the module callbacks;
-    # the on_message wrapper both merges AND signals the controller. on_connect /
-    # on_disconnect now ALSO publish the CONNECTED / DISCONNECTED status.
-    client.user_data_set({"serial": serial, "state": state})
-    client.on_connect = make_on_connect(controller)
-    client.on_message = make_on_message(controller)
-    client.on_disconnect = make_on_disconnect(controller)
-
-    if connect is None:
-        connect = make_connect(shutdown_event)
-    # Wrap the connect so a 401/auth rejection flips the tray to TOKEN_EXPIRED and
-    # drives the SAME re-login routine as the menu -- without adding a second
-    # reconnect loop (run_session keeps owning the backoff).
-    connect = make_status_connect(controller, connect, on_auth_fail=relogin_handler)
-
-    def network_runner():
-        """Run the single long-lived MQTT session (on the network thread)."""
-        try:
-            mqtt_client.run_session(client, connect=connect, sleep=sleep)
-        except Exception:  # noqa: BLE001 - never let the daemon thread crash loudly
-            logger.debug("network session ended with an exception", exc_info=False)
+    # Bind the live client into the relogin routine + the deferred start_mqtt hook
+    # so the menu/401 disconnect targets it and start_mqtt won't build a second.
+    relogin_handler.bind_client(client)
+    gui["start_mqtt"].client = client
+    gui["start_mqtt"].started = True  # eager path owns the session already
 
     return {
-        "icon": icon,
+        "icon": gui["icon"],
         "controller": controller,
         "client": client,
         "state": state,
         "network_runner": network_runner,
         "shutdown_event": shutdown_event,
-        # Phase 7 additions: the single hidden flyout, its js_api, and the bound
-        # tray LEFT-click toggle (main() runs webview.start() on this flyout).
-        "flyout": flyout,
-        "api": api,
-        "flyout_toggle": flyout_toggle,
+        "flyout": gui["flyout"],
+        "api": gui["api"],
+        "flyout_toggle": gui["flyout_toggle"],
+        "session": gui["session"],
+        "start_mqtt": gui["start_mqtt"],
+        "stop_session": gui["stop_session"],
+        "relogin_handler": relogin_handler,
     }
 
 

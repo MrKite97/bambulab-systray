@@ -559,11 +559,15 @@ def test_relogin_handler_callable_with_no_args(monkeypatch):
     assert ConnectionStatus.TOKEN_EXPIRED in controller.statuses
 
 
-def test_401_and_menu_share_relogin(monkeypatch):
-    """The automatic 401 path and the menu item reach the SAME re-login routine:
-    build_app wires the menu callback AND the connect wrapper's on_auth_fail to
-    one _ReloginHandler instance."""
-    captured = _patch_build_app(monkeypatch)
+def test_401_auto_relogin_flags_token_expired(monkeypatch):
+    """The automatic 401 path drives the shared _ReloginHandler: a token rejection
+    on connect flags TOKEN_EXPIRED on the controller and runs the fresh login.
+
+    Plan 08-02: the MENU re-login item now drives the PANEL login (a separate
+    callback -- see test_relogin_menu_drives_panel_not_console); the AUTOMATIC 401
+    path still routes through the shared _ReloginHandler exposed as
+    result["relogin_handler"]."""
+    _patch_build_app(monkeypatch)
     monkeypatch.setattr(app.token_store, "clear_token", lambda: None)
 
     calls = []
@@ -592,12 +596,9 @@ def test_401_and_menu_share_relogin(monkeypatch):
     )
     state["event"] = result["shutdown_event"]
 
-    # The menu's re-login callback IS a _ReloginHandler instance.
-    menu_handler = None
-    for text, action in captured["menu_items"]:
-        if text == app.RELOGIN_LABEL:
-            menu_handler = action
-    assert isinstance(menu_handler, app._ReloginHandler)
+    # The shared 401 routine IS a _ReloginHandler instance (the connect wrapper's
+    # on_auth_fail), exposed for the automatic path.
+    assert isinstance(result["relogin_handler"], app._ReloginHandler)
 
     # Drive the network runner. First connect raises an auth error; the wrapper
     # flags TOKEN_EXPIRED and runs the SAME routine. run_session then backs off
@@ -607,7 +608,7 @@ def test_401_and_menu_share_relogin(monkeypatch):
 
     # The shared routine ran the fresh login (force_relogin=True).
     assert calls and calls[0] is True
-    # The auto-401 path flagged TOKEN_EXPIRED on the same controller the menu uses.
+    # The auto-401 path flagged TOKEN_EXPIRED on the controller.
     assert result["controller"]._status is ConnectionStatus.TOKEN_EXPIRED
 
 
@@ -891,8 +892,9 @@ def test_get_initial_state_contains_no_secret(monkeypatch):
 
 
 def test_stub_action_logs_only_name_not_payload(monkeypatch, caplog):
-    """A stub page-action handler logs ONLY the action name, never the payload
-    (no email/password/code/command value reaches the logs -- T-07-02)."""
+    """The remaining stub action ('control') logs ONLY the action name, never the
+    command payload (T-07-02). The five auth/select actions are now real
+    SessionController methods (not stubs) and are covered by the session tests."""
     import logging
 
     _patch_build_app(monkeypatch)
@@ -900,16 +902,43 @@ def test_stub_action_logs_only_name_not_payload(monkeypatch, caplog):
     api = result["api"]
 
     with caplog.at_level(logging.DEBUG, logger="app"):
-        api.login_submit("secret@example.com", "hunter2")
-        api.submit_code("123456")
         api.control("pause")
 
-    assert "login_submit" in caplog.text  # the action NAME is logged
-    # ...but none of the sensitive payload values are.
-    assert "secret@example.com" not in caplog.text
-    assert "hunter2" not in caplog.text
-    assert "123456" not in caplog.text
-    assert "pause" not in caplog.text
+    assert "control" in caplog.text  # the action NAME is logged
+    assert "pause" not in caplog.text  # ...but never the command value
+
+
+def test_login_submit_handler_forwards_to_session(monkeypatch):
+    """build_app's bridge login_submit forwards to the real SessionController
+    (which drives auth.login on a worker) -- it is no longer a name-only stub.
+    The controller's worker runs inline here via a patched threading.Thread."""
+    _patch_build_app(monkeypatch)
+
+    login_calls = []
+    monkeypatch.setattr(
+        app.auth, "login", lambda e, p: login_calls.append((e, p)) or {"loginType": "verifyCode"}
+    )
+    monkeypatch.setattr(app.auth, "request_email_code", lambda e: None)
+
+    # Run the session worker bodies inline (no real daemon thread): patch the
+    # threading.Thread that src.session._default_run_async uses so .start() runs
+    # the target synchronously.
+    import src.session as session_mod
+
+    class InlineThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(session_mod.threading, "Thread", InlineThread)
+
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+    result["api"].login_submit("me@example.com", "pw")
+
+    assert login_calls == [("me@example.com", "pw")]
 
 
 def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
@@ -959,3 +988,164 @@ def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
     assert fake_icon.run_count == 0
     # The MAIN thread entered the GUI loop.
     assert fake_webview.start_calls == 1
+
+
+# --- Plan 08-02: SessionController wiring + deferred MQTT start --------------
+
+
+class FakeSession:
+    """Stand-in for src.session.SessionController exposing the five page actions
+    plus bootstrap_from_stored, each recording that it was called. Used to assert
+    the bridge handlers forward to the controller's bound methods (identity)."""
+
+    def __init__(self):
+        self.calls = []
+        self.bootstrap_result = True
+
+    def login_submit(self, email, password):
+        self.calls.append(("login_submit", email, password))
+
+    def submit_code(self, code):
+        self.calls.append(("submit_code", code))
+
+    def resend_code(self):
+        self.calls.append(("resend_code",))
+
+    def select_printer(self, device_id):
+        self.calls.append(("select_printer", device_id))
+
+    def logout(self):
+        self.calls.append(("logout",))
+
+    def bootstrap_from_stored(self):
+        self.calls.append(("bootstrap_from_stored",))
+        return self.bootstrap_result
+
+
+def test_make_bridge_handlers_wires_session_methods():
+    """The five auth/select actions forward to the SessionController's bound
+    methods (calling the handler calls the controller), 'hide' stays flyout.hide,
+    and 'control' stays a stub."""
+    flyout = RecordingFlyout()
+    session = FakeSession()
+
+    handlers = app.make_bridge_handlers(flyout, session)
+
+    # __self__ identity proves each handler is the SAME controller's bound method
+    # (a fresh bound-method object is created per attribute access, so `is`
+    # against session.login_submit would spuriously fail).
+    assert handlers["login_submit"].__self__ is session
+    assert handlers["login_submit"].__func__ is type(session).login_submit
+    assert handlers["submit_code"].__self__ is session
+    assert handlers["resend_code"].__self__ is session
+    assert handlers["select_printer"].__self__ is session
+    assert handlers["logout"].__self__ is session
+    assert handlers["hide"].__self__ is flyout  # flyout.hide bound method
+
+    # Forwarding: calling the bridge handler drives the controller method.
+    handlers["login_submit"]("me@example.com", "pw")
+    handlers["submit_code"]("123456")
+    handlers["select_printer"]("DEV1")
+    handlers["logout"]()
+    assert ("login_submit", "me@example.com", "pw") in session.calls
+    assert ("submit_code", "123456") in session.calls
+    assert ("select_printer", "DEV1") in session.calls
+    assert ("logout",) in session.calls
+
+    # 'control' is still a NAME-only stub this phase (Phase 9 wires it).
+    assert handlers["control"] is not getattr(session, "control", None)
+    assert callable(handlers["control"])
+
+
+def test_stub_actions_only_control_remaining():
+    """The remaining stubbed action is 'control' alone -- login/select/logout are
+    now real SessionController methods, not stubs."""
+    assert app._STUB_ACTIONS == ("control",)
+
+
+def test_make_session_builds_real_controller():
+    """make_session constructs a real src.session.SessionController with the
+    injected start_mqtt / stop_session hooks and the real auth/token_store/
+    settings modules."""
+    from src.session import SessionController
+
+    flyout = RecordingFlyout()
+    started = []
+    stopped = []
+
+    session = app.make_session(
+        flyout,
+        start_mqtt=lambda token, serial: started.append((token, serial)),
+        stop_session=lambda: stopped.append(True),
+        run_async=lambda fn: fn(),  # run worker bodies inline for the test
+    )
+
+    assert isinstance(session, SessionController)
+    assert session.flyout is flyout
+
+
+def _build_gui(monkeypatch, **kwargs):
+    """Build the token-less GUI seam with the test fakes already patched in.
+
+    Patches threading.Thread to a recording fake (so no real network thread
+    runs), then calls app.build_gui with the FakeWebview. Returns
+    (gui_dict, thread_starts_list)."""
+    _patch_build_app(monkeypatch)
+    monkeypatch.setattr(app.auth, "get_device_list", lambda t: [{"dev_id": "SER"}])
+
+    thread_starts = []
+
+    class FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            thread_starts.append(self.name)
+            if self.target is not None:
+                # Do NOT actually run the network loop (it would block); the
+                # name record is enough to assert the start-once guard.
+                pass
+
+    monkeypatch.setattr(app.threading, "Thread", FakeThread)
+
+    gui = app.build_gui(webview=FakeWebview(), **kwargs)
+    return gui, thread_starts
+
+
+def test_start_mqtt_hook_starts_network_thread_at_most_once(monkeypatch):
+    """The deferred start_mqtt hook starts the MQTT network thread EXACTLY ONCE
+    across repeated calls (idempotent guard -- T-08-09)."""
+    gui, thread_starts = _build_gui(monkeypatch)
+    start_mqtt = gui["start_mqtt"]
+
+    start_mqtt("TOKEN", "SER")
+    start_mqtt("TOKEN", "SER")
+    start_mqtt("TOKEN", "SER")
+
+    # Only ONE network thread was ever started despite three calls.
+    assert thread_starts.count("mqtt-network") == 1
+
+
+def test_start_mqtt_not_called_at_build_time(monkeypatch):
+    """build_gui NEVER starts the network thread itself -- only the start_mqtt
+    hook does, once a token + serial exist (deferred MQTT start)."""
+    gui, thread_starts = _build_gui(monkeypatch)
+    assert "mqtt-network" not in thread_starts  # nothing started by construction
+
+
+def test_stop_session_signals_shutdown_and_disconnects(monkeypatch):
+    """stop_session sets the shutdown event and disconnects the live client so
+    logout returns to a clean logged-out state (best-effort, never raising)."""
+    gui, _ = _build_gui(monkeypatch)
+    start_mqtt = gui["start_mqtt"]
+    stop_session = gui["stop_session"]
+
+    start_mqtt("TOKEN", "SER")  # build the live client
+    stop_session()
+
+    assert gui["shutdown_event"].is_set()
+    # The client built by start_mqtt was disconnected (best-effort).
+    assert start_mqtt.client is not None
+    assert start_mqtt.client.disconnect_count == 1
