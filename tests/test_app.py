@@ -407,3 +407,107 @@ def test_build_app_injects_clock_into_controller(monkeypatch):
 
     # The controller derives freshness from the injected clock.
     assert result["controller"]._now is clock
+
+
+# --- Re-login menu + flow ---------------------------------------------------
+
+
+def test_relogin_label_is_locked():
+    """RELOGIN_LABEL is exactly 'Opnieuw verbinden / inloggen' (LOCKED)."""
+    assert app.RELOGIN_LABEL == "Opnieuw verbinden / inloggen"
+
+
+def test_relogin_menu_clears_token_and_relogins(monkeypatch):
+    """The re-login handler, in order: flags TOKEN_EXPIRED, clears the stale token
+    BEFORE the fresh login, then drives get_token(force_relogin=True). No silent
+    refresh; no real network/stdin."""
+    events = []
+
+    monkeypatch.setattr(
+        app.token_store, "clear_token", lambda: events.append("clear_token")
+    )
+
+    def fake_get_token(*, force_relogin):
+        events.append(("get_token", force_relogin))
+        return "NEWTOKEN"
+
+    controller = FakeController()
+    client = FakeClient()
+    handler = app.make_relogin_handler(
+        client, threading.Event(), get_token=fake_get_token, controller=controller
+    )
+
+    # Invoke like a pystray menu callback (icon, item).
+    handler(icon=FakeIcon(), item=None)
+
+    # TOKEN_EXPIRED flagged so the tray shows "Opnieuw inloggen vereist".
+    assert ConnectionStatus.TOKEN_EXPIRED in controller.statuses
+    # clear_token ran BEFORE the fresh login (stale-credential reuse prevented).
+    assert events == ["clear_token", ("get_token", True)]
+    # The live session was torn down so the existing backoff reconnects fresh.
+    assert client.disconnect_count == 1
+
+
+def test_relogin_handler_callable_with_no_args(monkeypatch):
+    """The handler also works as a zero-arg on_auth_fail() hook (the connect
+    wrapper calls it without icon/item)."""
+    monkeypatch.setattr(app.token_store, "clear_token", lambda: None)
+    controller = FakeController()
+    handler = app.make_relogin_handler(
+        FakeClient(), threading.Event(),
+        get_token=lambda *, force_relogin: "T", controller=controller,
+    )
+    handler()  # no args -- must not raise
+    assert ConnectionStatus.TOKEN_EXPIRED in controller.statuses
+
+
+def test_401_and_menu_share_relogin(monkeypatch):
+    """The automatic 401 path and the menu item reach the SAME re-login routine:
+    build_app wires the menu callback AND the connect wrapper's on_auth_fail to
+    one _ReloginHandler instance."""
+    captured = _patch_build_app(monkeypatch)
+    monkeypatch.setattr(app.token_store, "clear_token", lambda: None)
+
+    calls = []
+
+    def fake_get_token(*, force_relogin):
+        calls.append(force_relogin)
+        return "NEWTOKEN"
+
+    # An injected connect that fails with an auth-equivalent error on the FIRST
+    # attempt (routing through the shared re-login routine) and then, once the
+    # shutdown event is set, raises StopSession so run_session ends (no infinite
+    # loop). The event is created inside build_app, so capture it after build.
+    state = {"attempts": 0, "event": None}
+
+    def failing_connect(client):
+        state["attempts"] += 1
+        if state["event"] is not None and state["event"].is_set():
+            raise app.mqtt_client.StopSession()
+        raise RuntimeError("Connection Refused: not authorized.")
+
+    result = app.build_app(
+        "HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG",
+        connect=failing_connect,
+        sleep=lambda s: state["event"].set(),  # after one backoff, end the loop
+        get_token=fake_get_token,
+    )
+    state["event"] = result["shutdown_event"]
+
+    # The menu's re-login callback IS a _ReloginHandler instance.
+    menu_handler = None
+    for text, action in captured["menu_items"]:
+        if text == app.RELOGIN_LABEL:
+            menu_handler = action
+    assert isinstance(menu_handler, app._ReloginHandler)
+
+    # Drive the network runner. First connect raises an auth error; the wrapper
+    # flags TOKEN_EXPIRED and runs the SAME routine. run_session then backs off
+    # (sleep sets the shutdown event) and retries; the second attempt raises
+    # StopSession so the loop ends cleanly.
+    result["network_runner"]()
+
+    # The shared routine ran the fresh login (force_relogin=True).
+    assert calls and calls[0] is True
+    # The auto-401 path flagged TOKEN_EXPIRED on the same controller the menu uses.
+    assert result["controller"]._status is ConnectionStatus.TOKEN_EXPIRED
