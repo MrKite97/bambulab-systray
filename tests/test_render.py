@@ -11,11 +11,14 @@ from src.render import (
     ICON_SIZE,
     icon_text,
     is_active_print,
+    render_for_display_state,
     render_for_state,
     render_icon,
+    tooltip_for_display_state,
     tooltip_text,
 )
 from src.state import PrintState
+from src.status import DisplayState
 
 
 def _state(gcode_state="RUNNING", mc_percent=0, mc_remaining_time=0):
@@ -153,3 +156,52 @@ def test_bundled_font_exists():
         os.path.dirname(os.path.dirname(__file__)), "assets", "DejaVuSans.ttf"
     )
     assert os.path.exists(font_path)
+
+
+# --- render_for_display_state (5-state glyphs) -----------------------------
+
+
+def _running_state():
+    return _state(gcode_state="RUNNING", mc_percent=47, mc_remaining_time=83)
+
+
+def test_render_for_display_state_is_64x64_rgba_for_all_states():
+    """Every display state renders a 64x64 RGBA image with visible opaque pixels."""
+    st = _running_state()
+    for ds in DisplayState:
+        img = render_for_display_state(ds, st)
+        assert img.mode == "RGBA"
+        assert img.size == (ICON_SIZE, ICON_SIZE) == (64, 64)
+        assert _opaque_coords(img), f"{ds} produced no opaque glyph"
+
+
+def test_render_for_display_state_active_and_idle_delegate():
+    """ACTIVE_PRINT reuses the time-digit render; NO_ACTIVE_PRINT reuses the neutral dot."""
+    st = _running_state()
+    assert _opaque_coords(
+        render_for_display_state(DisplayState.ACTIVE_PRINT, st)
+    ) == _opaque_coords(render_for_state(st))
+    assert _opaque_coords(
+        render_for_display_state(DisplayState.NO_ACTIVE_PRINT, st)
+    ) == _opaque_coords(render_icon(None))
+
+
+def test_display_states_are_visually_distinct():
+    """All five states produce pairwise-distinct opaque-pixel sets (legibility)."""
+    st = _running_state()
+    coords = {ds: _opaque_coords(render_for_display_state(ds, st)) for ds in DisplayState}
+    states = list(DisplayState)
+    for i in range(len(states)):
+        for j in range(i + 1, len(states)):
+            a, b = states[i], states[j]
+            assert coords[a] != coords[b], f"{a} and {b} render identically"
+
+
+def test_render_for_display_state_glyphs_fit_canvas():
+    """Each non-active glyph stays within the 64x64 canvas (getbbox in bounds)."""
+    st = _running_state()
+    for ds in DisplayState:
+        img = render_for_display_state(ds, st)
+        bbox = img.getbbox()
+        assert bbox is not None
+        assert bbox[2] <= ICON_SIZE and bbox[3] <= ICON_SIZE, f"{ds} overflows: {bbox}"
