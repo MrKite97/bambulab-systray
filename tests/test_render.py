@@ -146,14 +146,30 @@ def test_render_icon_idle_is_neutral_glyph():
     assert _opaque_coords(img) != _opaque_coords(render_icon("1:23"))
 
 
-def test_render_for_state_matches_icon_text():
-    """render_for_state(state) draws the same pixels as render_icon(icon_text(state))."""
-    active = _state(mc_percent=47, mc_remaining_time=83)
+def test_render_for_state_routes_through_printer_glyph():
+    """render_for_state draws the printer-fill glyph: active fills, idle has none."""
+    # Active RUNNING -> printing-blue frame WITH a neutral fill column by pct.
+    active = _state(gcode_state="RUNNING", mc_percent=80, mc_remaining_time=83)
+    a_img = render_for_state(active)
+    a_px = a_img.load()
+    assert a_px[_BUILD_CENTER_X, _BUILD_TOP] == status_to_color("printing", "dark")
+    assert _fill_column_height(a_img, _BUILD_CENTER_X) > 0
+    # IDLE -> neutral grey frame, NO fill column (ICON-02).
+    idle = _state(gcode_state="IDLE")
+    i_img = render_for_state(idle)
+    assert _fill_column_height(i_img, _BUILD_CENTER_X) == 0
+
+
+def test_render_for_state_matches_printer_icon():
+    """render_for_state(state) equals render_printer_icon for the derived status."""
+    active = _state(gcode_state="RUNNING", mc_percent=47)
     assert _opaque_coords(render_for_state(active)) == _opaque_coords(
-        render_icon(icon_text(active))
+        render_printer_icon(47, "printing")
     )
     idle = _state(gcode_state="IDLE")
-    assert _opaque_coords(render_for_state(idle)) == _opaque_coords(render_icon(None))
+    assert _opaque_coords(render_for_state(idle)) == _opaque_coords(
+        render_printer_icon(0, "neutral", logged_out=True)
+    )
 
 
 def test_bundled_font_exists():
@@ -181,26 +197,50 @@ def test_render_for_display_state_is_64x64_rgba_for_all_states():
         assert _opaque_coords(img), f"{ds} produced no opaque glyph"
 
 
-def test_render_for_display_state_active_and_idle_delegate():
-    """ACTIVE_PRINT reuses the time-digit render; NO_ACTIVE_PRINT reuses the neutral dot."""
+def test_render_for_display_state_active_has_fill_nonactive_have_none():
+    """ACTIVE_PRINT renders a status-color frame WITH a fill; the four non-active
+    states render a neutral grey frame with NO fill column (ICON-02)."""
+    st = _running_state()  # RUNNING, pct=47
+    active = render_for_display_state(DisplayState.ACTIVE_PRINT, st)
+    a_px = active.load()
+    assert a_px[_BUILD_CENTER_X, _BUILD_TOP] == status_to_color("printing", "dark")
+    assert _fill_column_height(active, _BUILD_CENTER_X) > 0
+
+    for ds in (
+        DisplayState.NO_ACTIVE_PRINT,
+        DisplayState.PRINTER_OFFLINE,
+        DisplayState.CLOUD_DISCONNECTED,
+        DisplayState.TOKEN_EXPIRED,
+    ):
+        img = render_for_display_state(ds, st)
+        px = img.load()
+        # Neutral grey frame, no fill.
+        assert px[_BUILD_CENTER_X, _BUILD_TOP] == status_to_color("neutral", "dark")
+        assert _fill_column_height(img, _BUILD_CENTER_X) == 0, f"{ds} has a fill column"
+
+
+def test_render_for_display_state_active_matches_printer_glyph():
+    """ACTIVE_PRINT delegates to render_printer_icon for the derived status."""
     st = _running_state()
     assert _opaque_coords(
         render_for_display_state(DisplayState.ACTIVE_PRINT, st)
-    ) == _opaque_coords(render_for_state(st))
-    assert _opaque_coords(
-        render_for_display_state(DisplayState.NO_ACTIVE_PRINT, st)
-    ) == _opaque_coords(render_icon(None))
+    ) == _opaque_coords(render_printer_icon(st.mc_percent, "printing"))
 
 
-def test_display_states_are_visually_distinct():
-    """All five states produce pairwise-distinct opaque-pixel sets (legibility)."""
+def test_non_active_display_states_share_neutral_logged_out_frame():
+    """The four non-active states all render the same neutral grey logged-out frame.
+
+    Phase 6 intentionally unifies them visually (the distinction is in the
+    tooltip wording, not the glyph)."""
     st = _running_state()
-    coords = {ds: _opaque_coords(render_for_display_state(ds, st)) for ds in DisplayState}
-    states = list(DisplayState)
-    for i in range(len(states)):
-        for j in range(i + 1, len(states)):
-            a, b = states[i], states[j]
-            assert coords[a] != coords[b], f"{a} and {b} render identically"
+    expected = _opaque_coords(render_printer_icon(0, "neutral", logged_out=True))
+    for ds in (
+        DisplayState.NO_ACTIVE_PRINT,
+        DisplayState.PRINTER_OFFLINE,
+        DisplayState.CLOUD_DISCONNECTED,
+        DisplayState.TOKEN_EXPIRED,
+    ):
+        assert _opaque_coords(render_for_display_state(ds, st)) == expected
 
 
 def test_render_for_display_state_glyphs_fit_canvas():

@@ -258,69 +258,50 @@ def render_printer_icon(
 
 
 def render_for_state(state: PrintState) -> Image.Image:
-    """Icon for a PrintState: time digits when active, neutral glyph when idle."""
-    return render_icon(icon_text(state))
+    """Icon for a PrintState: the printer-fill glyph driven by gcode_state + pct.
+
+    Status is derived from ``gcode_state`` (RUNNING->printing, PAUSE->paused,
+    FINISH->done, FAILED->error, idle/unknown->neutral). The neutral case
+    renders a grey frame with NO fill; active states fill by ``mc_percent``.
+    ``render_icon`` / ``icon_text`` remain as the legacy text fallback path.
+    """
+    status = status_from_gcode_state(state.gcode_state)
+    logged_out = status == "neutral"
+    return render_printer_icon(state.mc_percent, status, logged_out=logged_out)
 
 
-# --- 5-state display rendering (Phase 3) -----------------------------------
+# --- 5-state display rendering (Phase 6: printer-fill glyph) ----------------
 # The display-state machine lives in src.status (DisplayState / tooltip_for).
-# This layer turns each of the five states into a distinct, 16x16-survivable
-# 64x64 glyph and a tooltip. ACTIVE_PRINT / NO_ACTIVE_PRINT reuse the existing
-# active/idle render path unchanged; the three connection/token states each get
-# a legible centered glyph drawn with the bundled font. The tooltip carries the
-# exact locked Dutch wording (delegated to status.tooltip_for) -- this glyph
-# only needs to be visually distinct at a glance.
-
-_GLYPH_FONT_SIZE = 48
-
-
-def _render_centered_glyph(text: str, fill: tuple[int, int, int, int]) -> Image.Image:
-    """Render a single centered glyph string on a 64x64 RGBA canvas (no digits path)."""
-    img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    font = _load_font(_GLYPH_FONT_SIZE)
-    bbox = d.textbbox((0, 0), text, font=font)
-    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    d.text(
-        ((ICON_SIZE - w) / 2 - bbox[0], (ICON_SIZE - h) / 2 - bbox[1]),
-        text,
-        font=font,
-        fill=fill,
-    )
-    return img
+# Since Phase 6 every display state renders through render_printer_icon:
+# ACTIVE_PRINT is a status-colored printer frame filled to mc_percent; the four
+# non-active states all render the neutral grey "logged-out" frame with no fill
+# (ICON-02). The at-a-glance difference between the non-active states lives in
+# the tooltip wording (delegated to status.tooltip_for), which is unchanged.
 
 
 def render_for_display_state(display_state: "DisplayState", state: PrintState) -> Image.Image:
-    """Render a distinct 64x64 RGBA glyph for one of the five display states.
+    """Render the printer-fill glyph for one of the five display states.
 
-    ACTIVE_PRINT       -> existing time-digit render (render_for_state).
-    NO_ACTIVE_PRINT    -> existing neutral grey dot (render_icon(None)).
-    PRINTER_OFFLINE    -> a dimmed hollow ring (distinct from the idle dot).
-    CLOUD_DISCONNECTED -> a centered ellipsis (connecting).
-    TOKEN_EXPIRED      -> a centered '!' (sign-in required).
+    ACTIVE_PRINT       -> printer glyph in the status color (printing/paused by
+                          gcode_state) with a neutral fill scaled to mc_percent.
+    NO_ACTIVE_PRINT    -> neutral grey frame, NO fill.
+    PRINTER_OFFLINE    -> neutral grey frame, NO fill.
+    CLOUD_DISCONNECTED -> neutral grey frame, NO fill.
+    TOKEN_EXPIRED      -> neutral grey frame, NO fill.
 
-    Reads only DisplayState + PrintState fields the existing paths already use;
-    no secret is referenced and nothing logs.
+    The four non-active states all show the same neutral grey "logged-out" frame
+    (ICON-02); the at-a-glance distinction between them lives in the tooltip
+    wording, which is unchanged. Reads only gcode_state / mc_percent; no secret
+    is referenced and nothing logs.
     """
     from src.status import DisplayState  # local import: avoids render<->status cycle
 
     if display_state is DisplayState.ACTIVE_PRINT:
-        return render_for_state(state)
-    if display_state is DisplayState.NO_ACTIVE_PRINT:
-        return render_icon(None)
-    if display_state is DisplayState.PRINTER_OFFLINE:
-        # Dimmed hollow ring: same footprint band as the idle dot but an outline
-        # (not a fill) in a dimmer grey -> a different opaque-pixel set.
-        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse((18, 18, 46, 46), outline=(110, 110, 110, 255), width=4)
-        return img
-    if display_state is DisplayState.CLOUD_DISCONNECTED:
-        return _render_centered_glyph("…", (180, 180, 180, 255))
-    if display_state is DisplayState.TOKEN_EXPIRED:
-        return _render_centered_glyph("!", (235, 180, 40, 255))
-    # Unreachable for the 5-member enum, but keep total and non-raising.
-    return render_icon(None)
+        status = status_from_gcode_state(state.gcode_state)
+        return render_printer_icon(state.mc_percent, status)
+    # All non-active states (and any unexpected value) -> neutral grey frame,
+    # no fill. Kept total and non-raising.
+    return render_printer_icon(0, "neutral", logged_out=True)
 
 
 def tooltip_for_display_state(display_state: "DisplayState", state: PrintState) -> str:
