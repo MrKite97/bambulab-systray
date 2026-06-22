@@ -7,13 +7,19 @@ rendering is verified by asserting on format strings and the produced PIL image.
 
 import os
 
+import pytest
+
 from src.render import (
     ICON_SIZE,
+    detect_windows_theme,
     icon_text,
     is_active_print,
     render_for_display_state,
     render_for_state,
     render_icon,
+    render_printer_icon,
+    status_from_gcode_state,
+    status_to_color,
     tooltip_for_display_state,
     tooltip_text,
 )
@@ -246,3 +252,174 @@ def test_non_active_states_never_leak_stale_numbers():
         tip = tooltip_for_display_state(ds, stale)
         assert "47%" not in tip, f"{ds} leaked stale percent: {tip!r}"
         assert "nog" not in tip, f"{ds} leaked stale remaining: {tip!r}"
+
+
+# --- status_to_color (theme-aware, locked hex) -----------------------------
+
+# Locked expected RGBA values (alpha 255) for the dark theme.
+_DARK = {
+    "printing": (84, 197, 255, 255),  # #54C5FF
+    "paused": (255, 203, 69, 255),  # #FFCB45
+    "done": (111, 208, 106, 255),  # #6FD06A
+    "error": (255, 138, 149, 255),  # #FF8A95
+    "neutral": (154, 160, 170, 255),  # #9AA0AA
+}
+# Locked expected RGBA values (alpha 255) for the light theme.
+_LIGHT = {
+    "printing": (0, 103, 192, 255),  # #0067C0
+    "paused": (154, 91, 0, 255),  # #9A5B00
+    "done": (16, 124, 16, 255),  # #107C10
+    "error": (196, 43, 28, 255),  # #C42B1C
+    "neutral": (136, 136, 146, 255),  # #888892
+}
+
+
+def test_status_to_color_dark_locked_hex():
+    """Each status maps to the exact locked dark hex (alpha 255)."""
+    for status, expected in _DARK.items():
+        assert status_to_color(status, "dark") == expected
+
+
+def test_status_to_color_light_locked_hex():
+    """Each status maps to the exact locked light hex (alpha 255)."""
+    for status, expected in _LIGHT.items():
+        assert status_to_color(status, "light") == expected
+
+
+def test_status_to_color_unknown_falls_back_to_neutral():
+    """An unknown status returns the neutral entry and never raises."""
+    assert status_to_color("nonsense", "dark") == _DARK["neutral"]
+    assert status_to_color("", "light") == _LIGHT["neutral"]
+
+
+# --- status_from_gcode_state -----------------------------------------------
+
+
+def test_status_from_gcode_state_known_mappings():
+    """gcode_state maps to status keys, case-insensitively."""
+    assert status_from_gcode_state("RUNNING") == "printing"
+    assert status_from_gcode_state("running") == "printing"
+    assert status_from_gcode_state("PAUSE") == "paused"
+    assert status_from_gcode_state("FINISH") == "done"
+    assert status_from_gcode_state("FAILED") == "error"
+
+
+def test_status_from_gcode_state_neutral_fallbacks():
+    """IDLE / PREPARE / unknown / empty all fall through to neutral."""
+    for s in ("IDLE", "PREPARE", "unknown", "", "garbage"):
+        assert status_from_gcode_state(s) == "neutral"
+
+
+# --- detect_windows_theme --------------------------------------------------
+
+
+def test_detect_windows_theme_returns_valid_value():
+    """detect_windows_theme never raises and returns 'light' or 'dark'."""
+    assert detect_windows_theme() in ("light", "dark")
+
+
+# --- render_printer_icon ---------------------------------------------------
+
+# Build-area geometry (mirrors render.py constants; sampled in tests).
+_BUILD_LEFT, _BUILD_RIGHT = 14, 50
+_BUILD_TOP, _PLATE_Y = 18, 50
+_BUILD_CENTER_X = (_BUILD_LEFT + _BUILD_RIGHT) // 2
+
+
+def _fill_column_opaque_count(img, x):
+    """Count opaque pixels strictly inside the build area at column x."""
+    px = img.load()
+    return sum(
+        1
+        for y in range(_BUILD_TOP + 1, _PLATE_Y)
+        if px[x, y][3] == 255
+    )
+
+
+def test_render_printer_icon_is_64x64_rgba():
+    """render_printer_icon returns a 64x64 RGBA image."""
+    img = render_printer_icon(50, "printing", theme="dark")
+    assert img.mode == "RGBA"
+    assert img.size == (ICON_SIZE, ICON_SIZE) == (64, 64)
+
+
+def test_render_printer_icon_fill_height_grows_with_pct():
+    """A higher pct produces a taller neutral-grey fill column."""
+    low = render_printer_icon(10, "printing", theme="dark")
+    high = render_printer_icon(80, "printing", theme="dark")
+    low_h = _fill_column_opaque_count(low, _BUILD_CENTER_X)
+    high_h = _fill_column_opaque_count(high, _BUILD_CENTER_X)
+    assert high_h > low_h, f"expected pct=80 taller than pct=10 ({high_h} <= {low_h})"
+
+
+def test_render_printer_icon_frame_is_status_color():
+    """A frame pixel equals the mapped status color (printing), not the neutral fill."""
+    img = render_printer_icon(50, "printing", theme="dark")
+    px = img.load()
+    # Top frame stroke runs across the build top; sample its center.
+    frame_pixel = px[_BUILD_CENTER_X, _BUILD_TOP]
+    assert frame_pixel == status_to_color("printing", "dark") == (84, 197, 255, 255)
+    assert frame_pixel != status_to_color("neutral", "dark")
+
+
+def test_render_printer_icon_fill_is_neutral_not_status():
+    """The fill column is neutral material grey, never the status color."""
+    img = render_printer_icon(80, "printing", theme="dark")
+    px = img.load()
+    # A pixel near the plate, inside the build area, is in the fill at pct=80.
+    fill_pixel = px[_BUILD_CENTER_X, _PLATE_Y - 2]
+    assert fill_pixel == status_to_color("neutral", "dark") == (154, 160, 170, 255)
+    assert fill_pixel != status_to_color("printing", "dark")
+
+
+def test_render_printer_icon_logged_out_has_no_fill():
+    """logged_out=True renders a frame but no opaque pixels strictly inside the build area."""
+    img = render_printer_icon(80, "printing", theme="dark", logged_out=True)
+    # No fill column at the build center.
+    assert _fill_column_opaque_count(img, _BUILD_CENTER_X) == 0
+
+
+def test_render_printer_icon_neutral_status_has_no_fill():
+    """status='neutral' renders a grey frame with no fill column (ICON-02)."""
+    img = render_printer_icon(80, "neutral", theme="dark")
+    assert _fill_column_opaque_count(img, _BUILD_CENTER_X) == 0
+
+
+def test_render_printer_icon_pct1_frame_fully_visible():
+    """At pct=1 the colored frame stays fully visible (~unchanged frame pixel count)."""
+    px1 = render_printer_icon(1, "printing", theme="dark")
+    px80 = render_printer_icon(80, "printing", theme="dark")
+
+    def _frame_pixels(img):
+        load = img.load()
+        color = status_to_color("printing", "dark")
+        return {
+            (x, y)
+            for x in range(ICON_SIZE)
+            for y in range(ICON_SIZE)
+            if load[x, y] == color
+        }
+
+    f1 = len(_frame_pixels(px1))
+    f80 = len(_frame_pixels(px80))
+    assert f1 > 0
+    # Frame stroke is independent of fill; counts should match closely.
+    assert abs(f1 - f80) <= 4, f"frame changed too much with pct ({f1} vs {f80})"
+
+
+def test_render_printer_icon_theme_selects_hex():
+    """theme='light' frame uses the light hex; theme='dark' uses the dark hex."""
+    dark = render_printer_icon(50, "printing", theme="dark").load()
+    light = render_printer_icon(50, "printing", theme="light").load()
+    assert dark[_BUILD_CENTER_X, _BUILD_TOP] == (84, 197, 255, 255)
+    assert light[_BUILD_CENTER_X, _BUILD_TOP] == (0, 103, 192, 255)
+
+
+@pytest.mark.parametrize("pct", [0, 1, 10, 50, 80, 100])
+@pytest.mark.parametrize("status", ["printing", "paused", "done", "error", "neutral"])
+def test_render_printer_icon_grid_returns_rgba(pct, status):
+    """Every pct x status combination returns a 64x64 RGBA image with opaque pixels."""
+    img = render_printer_icon(pct, status, theme="dark")
+    assert img.mode == "RGBA"
+    assert img.size == (64, 64)
+    assert _opaque_coords(img), f"pct={pct} status={status} produced no opaque glyph"
