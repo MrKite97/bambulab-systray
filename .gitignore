@@ -5,3 +5,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# PyInstaller build artifacts (the .spec is checked in; dist/build are not)
+dist/
+build/
+*.exe
