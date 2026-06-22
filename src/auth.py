@@ -96,6 +96,31 @@ def pick_serial(devices: list[dict]) -> str:
     return devices[0]["dev_id"]
 
 
+def enrich_devices(devices: list[dict]) -> list[dict]:
+    """Map raw bind devices to the {dev_id, name, dev_model_name, online} rows
+    the Phase 8 printer-select screen needs.
+
+    Extra bind fields (e.g. ``dev_access_code``) are intentionally dropped --
+    only the four display fields cross into the UI. Every optional key is read
+    with ``.get(..., default)`` so a sparse row (only ``dev_id`` present) yields
+    sane defaults (``name``/``dev_model_name`` == "", ``online`` == False) and
+    never raises. Input order is preserved.
+
+    There is NO region key in the bind payload (RESEARCH Pitfall 3) -- region
+    stays hardcoded global/EU; none is read or introduced here. Device contents
+    are not logged.
+    """
+    return [
+        {
+            "dev_id": d.get("dev_id"),
+            "name": d.get("name", ""),
+            "dev_model_name": d.get("dev_model_name", ""),
+            "online": d.get("online", False),
+        }
+        for d in devices
+    ]
+
+
 def mqtt_username_from_token(access_token: str) -> str:
     """Derive the MQTT username from the access-token JWT (RESEARCH Pattern 3).
 

@@ -130,6 +130,74 @@ def test_pick_serial_empty_list_raises_clear_error():
 
 
 # --------------------------------------------------------------------------- #
+# Task 1b: enrich_devices -- structured {dev_id,name,dev_model_name,online} rows
+# --------------------------------------------------------------------------- #
+
+
+def test_enrich_devices_maps_exactly_four_keys():
+    """A full bind row is mapped to EXACTLY {dev_id,name,dev_model_name,online};
+    extra keys (e.g. dev_access_code) are dropped."""
+    devices = [
+        {
+            "dev_id": "00M00A",
+            "name": "Studio P1S",
+            "dev_model_name": "P1S",
+            "online": True,
+            "dev_access_code": "SECRET_DROP_ME",
+        }
+    ]
+    rows = auth.enrich_devices(devices)
+    assert rows == [
+        {
+            "dev_id": "00M00A",
+            "name": "Studio P1S",
+            "dev_model_name": "P1S",
+            "online": True,
+        }
+    ]
+    # Extra bind fields are not carried through.
+    assert set(rows[0].keys()) == {"dev_id", "name", "dev_model_name", "online"}
+    assert "dev_access_code" not in rows[0]
+
+
+def test_enrich_devices_sparse_row_uses_safe_defaults():
+    """A row with only dev_id yields safe defaults (no KeyError)."""
+    rows = auth.enrich_devices([{"dev_id": "ONLY_ID"}])
+    assert rows == [
+        {
+            "dev_id": "ONLY_ID",
+            "name": "",
+            "dev_model_name": "",
+            "online": False,
+        }
+    ]
+
+
+def test_enrich_devices_preserves_order():
+    """Output order matches input order."""
+    devices = [{"dev_id": "A"}, {"dev_id": "B"}, {"dev_id": "C"}]
+    rows = auth.enrich_devices(devices)
+    assert [r["dev_id"] for r in rows] == ["A", "B", "C"]
+
+
+def test_enrich_devices_empty_list_returns_empty():
+    """Empty input -> empty output, no raise."""
+    assert auth.enrich_devices([]) == []
+
+
+def test_enrich_devices_does_not_introduce_region_key():
+    """There is no region key in the bind payload (Pitfall 3); none is added."""
+    rows = auth.enrich_devices([{"dev_id": "A", "region": "should_be_ignored"}])
+    assert "region" not in rows[0]
+
+
+def test_pick_serial_back_compat_after_enrich(monkeypatch):
+    """Regression: pick_serial still returns devices[0]['dev_id'] unchanged."""
+    devices = [{"dev_id": "FIRST", "name": "x"}, {"dev_id": "SECOND"}]
+    assert auth.pick_serial(devices) == "FIRST"
+
+
+# --------------------------------------------------------------------------- #
 # Task 2: mqtt_username_from_token -- JWT username claim
 # --------------------------------------------------------------------------- #
 
