@@ -41,8 +41,9 @@ from uuid import uuid4
 
 import pystray
 
-from src import auth, mqtt_client, render, spike
+from src import auth, mqtt_client, render, spike, token_store
 from src.state import PrintState
+from src.status import ConnectionStatus
 from src.tray import TrayController
 
 logger = logging.getLogger("app")
@@ -50,6 +51,10 @@ logger = logging.getLogger("app")
 # The single right-click menu label (LOCKED by 02-CONTEXT.md). Exposed as a
 # module constant so tests assert the exact text without a heavy pystray import.
 QUIT_LABEL = "Afsluiten"
+
+# The "Opnieuw verbinden / inloggen" menu label (LOCKED by 03-CONTEXT.md). It
+# sits ALONGSIDE 'Afsluiten' and drives a fresh verifyCode login (REL-02).
+RELOGIN_LABEL = "Opnieuw verbinden / inloggen"
 
 
 def make_on_message(controller):
@@ -68,6 +73,67 @@ def make_on_message(controller):
         controller.on_state_change()  # enqueue a repaint (UI thread applies it)
 
     return _on_message
+
+
+def make_on_connect(controller):
+    """Wrap ``mqtt_client.on_connect`` so each (re)connect ALSO publishes a
+    CONNECTED status transition to the controller.
+
+    Runs on the NETWORK (paho) callback thread. After the vetted module-level
+    on_connect (subscribe + pushall) it only ENQUEUES the status via
+    ``set_connection_status`` -- it NEVER mutates the icon. The UI pump derives
+    the 5-state display from the latest status + PrintState (REL-01/REL-03).
+    """
+
+    def _on_connect(client, userdata, flags, reason_code, properties):
+        mqtt_client.on_connect(client, userdata, flags, reason_code, properties)
+        controller.set_connection_status(ConnectionStatus.CONNECTED)
+
+    return _on_connect
+
+
+def make_on_disconnect(controller):
+    """Wrap the (inert) ``mqtt_client.on_disconnect`` so a drop ALSO publishes a
+    DISCONNECTED status transition ("Verbinden…") to the controller.
+
+    Reconnection stays owned solely by ``run_session``'s backoff -- this wrapper
+    adds NO reconnect; it only enqueues the status so the tray reflects the drop
+    while the existing single-session backoff recovers (REL-01/REL-03).
+    """
+
+    def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        mqtt_client.on_disconnect(client, userdata, disconnect_flags, reason_code, properties)
+        controller.set_connection_status(ConnectionStatus.DISCONNECTED)
+
+    return _on_disconnect
+
+
+def make_status_connect(controller, inner_connect, *, on_auth_fail):
+    """Wrap an injected ``connect`` so a token/auth rejection flips the tray to
+    TOKEN_EXPIRED and triggers re-login, WITHOUT adding a second reconnect loop.
+
+    ``inner_connect`` is the real connect callable handed to
+    ``mqtt_client.run_session`` (e.g. the one from :func:`make_connect`). On any
+    failure we inspect it with ``spike._auth_failed`` (the SAME 401 detector the
+    Phase 1 spike uses): a token rejection enqueues
+    ``ConnectionStatus.TOKEN_EXPIRED`` and runs ``on_auth_fail`` (the shared
+    re-login routine), then RE-RAISES so ``run_session`` keeps owning the
+    backoff/loop. A non-auth (transient) failure is just re-raised so the
+    existing backoff retries -- no TOKEN_EXPIRED, no new loop.
+    """
+
+    def _connect(client):
+        try:
+            inner_connect(client)
+        except mqtt_client.StopSession:
+            raise  # clean quit -> let run_session end the loop
+        except Exception as exc:  # noqa: BLE001 - classify auth vs transient
+            if spike._auth_failed(exc):
+                controller.set_connection_status(ConnectionStatus.TOKEN_EXPIRED)
+                on_auth_fail()
+            raise  # re-raise either way: run_session owns the backoff/retry
+
+    return _connect
 
 
 def make_quit_handler(client, shutdown_event):
@@ -90,6 +156,62 @@ def make_quit_handler(client, shutdown_event):
         icon.stop()  # disposes the tray icon (NO orphan); always reached
 
     return _on_quit
+
+
+class _ReloginHandler:
+    """The single re-login routine BOTH the menu item and the automatic 401 path
+    converge on (REL-02). Implemented as a callable object so it works as a
+    pystray menu callback (``handler(icon, item)``) AND as a zero-arg
+    ``on_auth_fail()`` hook from the connect wrapper.
+
+    Each invocation, in this exact order (threat T-03-06/T-03-07):
+      1. flag ConnectionStatus.TOKEN_EXPIRED so the tray shows
+         "Opnieuw inloggen vereist" immediately,
+      2. clear the stale token via ``token_store.clear_token()`` BEFORE any
+         fresh login -- a rejected/stale token is never reused,
+      3. drive a FRESH verifyCode login via ``get_token(force_relogin=True)``
+         (no silent refresh -- the Bambu refresh endpoint is dead),
+      4. tear down the current MQTT session (``client.disconnect()``) so the
+         EXISTING ``run_session`` backoff reconnects with the new token -- no
+         second reconnect mechanism is introduced.
+
+    The token/password are never logged. ``get_token`` is injected so tests drive
+    it without real stdin/network.
+    """
+
+    def __init__(self, client, shutdown_event, *, get_token, controller=None):
+        self._client = client
+        self._shutdown_event = shutdown_event
+        self._get_token = get_token
+        self._controller = controller
+
+    def bind_controller(self, controller):
+        """Late-bind the controller (build_app builds the handler before the
+        TrayController exists so the menu can reference it)."""
+        self._controller = controller
+
+    def __call__(self, icon=None, item=None):
+        if self._controller is not None:
+            # (1) visible "Opnieuw inloggen vereist" -- enqueue only, never icon.
+            self._controller.set_connection_status(ConnectionStatus.TOKEN_EXPIRED)
+        # (2) clear the stale token FIRST (no stale-credential reuse).
+        token_store.clear_token()
+        # (3) FRESH verifyCode login (force_relogin=True; no silent refresh).
+        #     The new token is persisted inside spike.get_access_token.
+        self._get_token(force_relogin=True)
+        # (4) drop the live session so the existing backoff reconnects with the
+        #     new token. Never raise out of a menu callback / teardown path.
+        try:
+            self._client.disconnect()
+        except Exception:  # noqa: BLE001 - teardown must not break the UI/auth path
+            logger.debug("client.disconnect() raised during re-login; continuing")
+
+
+def make_relogin_handler(client, shutdown_event, *, get_token, controller=None):
+    """Build the shared re-login routine (see :class:`_ReloginHandler`)."""
+    return _ReloginHandler(
+        client, shutdown_event, get_token=get_token, controller=controller
+    )
 
 
 def make_setup(controller, shutdown_event, *, pump_interval=1.0):
@@ -143,7 +265,16 @@ def make_connect(shutdown_event):
     return _connect
 
 
-def build_app(token, *, connect=None, sleep=None):
+def build_app(
+    token,
+    *,
+    connect=None,
+    sleep=None,
+    now=time.monotonic,
+    get_token=None,
+    email=None,
+    password=None,
+):
     """Compose the whole app from an already-acquired ``token`` and return the
     wired pieces WITHOUT starting any thread or launching a real tray.
 
@@ -152,6 +283,12 @@ def build_app(token, *, connect=None, sleep=None):
     ``shutdown_event``. This is the injectable seam the tests drive with fakes:
     they monkeypatch ``auth.*`` / ``mqtt_client.build_client`` so no real broker,
     login, or tray is ever touched. The token is never logged.
+
+    ``now`` is the injectable monotonic clock threaded into the TrayController so
+    the freshness/offline watcher is driveable in tests with no real waits.
+    ``get_token`` is the injectable re-login closure (defaults to a
+    ``spike.get_access_token`` binding) so the menu/401 re-login path runs
+    without real stdin/network in tests.
     """
     if sleep is None:
         sleep = time.sleep
@@ -174,24 +311,55 @@ def build_app(token, *, connect=None, sleep=None):
         access_token=token,
     )
     quit_handler = make_quit_handler(client, shutdown_event)
+
+    # Default the re-login token source to a spike.get_access_token closure so the
+    # menu/401 path drives a FRESH verifyCode login (console verifyCode prompt is
+    # reused from Phase 1). Injected in tests so it runs with no real stdin.
+    if get_token is None:
+        def get_token(*, force_relogin):
+            return spike.get_access_token(
+                email or "", password or "", force_relogin=force_relogin
+            )
+
+    # The re-login routine BOTH the menu item and the automatic 401 path converge
+    # on. Clears the stale token first, then forces a fresh login (no silent
+    # refresh) and tears down the live session so run_session reconnects with the
+    # new token. Built before the menu so the menu item can reference it.
+    relogin_handler = make_relogin_handler(
+        client, shutdown_event, get_token=get_token, controller=None
+    )
+
     icon = pystray.Icon(
         "bambu-systray",
         icon=render.render_icon(None),  # neutral icon until the first report
         title=render.tooltip_text(state),  # "Geen actieve print"
-        menu=pystray.Menu(pystray.MenuItem(QUIT_LABEL, quit_handler)),
+        # Re-login item sits ALONGSIDE Afsluiten (REL-02). Order: reconnect first.
+        menu=pystray.Menu(
+            pystray.MenuItem(RELOGIN_LABEL, relogin_handler),
+            pystray.MenuItem(QUIT_LABEL, quit_handler),
+        ),
     )
 
-    controller = TrayController(icon, state)
+    # Inject the monotonic clock so the freshness/offline watcher is driveable.
+    controller = TrayController(icon, state, now=now)
+    # The re-login routine needs the controller to flag TOKEN_EXPIRED; wire it now
+    # that the controller exists (the menu callback closes over this same object).
+    relogin_handler.bind_controller(controller)
 
     # Wire the client: userdata carries serial+state for the module callbacks;
-    # the on_message wrapper both merges AND signals the controller.
+    # the on_message wrapper both merges AND signals the controller. on_connect /
+    # on_disconnect now ALSO publish the CONNECTED / DISCONNECTED status.
     client.user_data_set({"serial": serial, "state": state})
-    client.on_connect = mqtt_client.on_connect
+    client.on_connect = make_on_connect(controller)
     client.on_message = make_on_message(controller)
-    client.on_disconnect = mqtt_client.on_disconnect
+    client.on_disconnect = make_on_disconnect(controller)
 
     if connect is None:
         connect = make_connect(shutdown_event)
+    # Wrap the connect so a 401/auth rejection flips the tray to TOKEN_EXPIRED and
+    # drives the SAME re-login routine as the menu -- without adding a second
+    # reconnect loop (run_session keeps owning the backoff).
+    connect = make_status_connect(controller, connect, on_auth_fail=relogin_handler)
 
     def network_runner():
         """Run the single long-lived MQTT session (on the network thread)."""
@@ -244,7 +412,9 @@ def main(argv=None) -> int:
         logger.error("%s", exc)
         return 1
 
-    app = build_app(token)
+    # Pass the credentials so the menu/401 re-login can drive a fresh login. They
+    # are held only in memory and never logged (T-03-06).
+    app = build_app(token, email=email, password=password)
     icon = app["icon"]
     controller = app["controller"]
 

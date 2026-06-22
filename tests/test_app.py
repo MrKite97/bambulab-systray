@@ -101,13 +101,14 @@ def test_quit_label_is_afsluiten():
     assert app.QUIT_LABEL == "Afsluiten"
 
 
-def test_built_menu_item_text_is_afsluiten(monkeypatch):
-    """The pystray MenuItem constructed by build_app carries the text 'Afsluiten'."""
+def test_built_menu_items_are_relogin_and_afsluiten(monkeypatch):
+    """The pystray menu carries BOTH 'Opnieuw verbinden / inloggen' AND 'Afsluiten'
+    (the re-login item sits alongside Afsluiten -- REL-02)."""
     icon = _patch_build_app(monkeypatch)
     app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
-    # The fake pystray.MenuItem records its (text, callback); assert the label.
-    assert icon["menu_items"], "a menu item should have been constructed"
-    assert icon["menu_items"][0][0] == "Afsluiten"
+    labels = [text for text, _ in icon["menu_items"]]
+    assert "Opnieuw verbinden / inloggen" in labels
+    assert "Afsluiten" in labels
 
 
 # --- Quit teardown ----------------------------------------------------------
@@ -247,7 +248,11 @@ def test_build_app_returns_wired_triple_without_network(monkeypatch):
     assert result["client"].userdata["serial"] == "SER"
     assert result["client"].userdata["state"] is result["state"]
     assert result["client"].on_message is not None
-    assert result["client"].on_connect is app.mqtt_client.on_connect
+    # on_connect is now WRAPPED (it also publishes the CONNECTED status) -- it is
+    # no longer the bare mqtt_client.on_connect but a wrapper that calls it.
+    assert callable(result["client"].on_connect)
+    assert result["client"].on_connect is not app.mqtt_client.on_connect
+    assert callable(result["client"].on_disconnect)
 
 
 def test_build_app_does_not_log_token(monkeypatch, caplog):
