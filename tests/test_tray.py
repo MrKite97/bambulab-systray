@@ -12,8 +12,9 @@ deltas to a single repaint. No network, no real pystray, no secrets.
 
 import threading
 
-from src import tray
+from src import status, tray
 from src.state import PrintState
+from src.status import ConnectionStatus, DisplayState, FRESHNESS_TIMEOUT_SECONDS
 
 
 class FakeIcon:
@@ -42,6 +43,33 @@ def _active(percent, remaining):
     )
 
 
+class _FakeClock:
+    """A tiny advanceable monotonic clock (no real waits). Tests read the current
+    value via __call__ (so it drops in as TrayController(now=...)) and move time
+    forward with advance()."""
+
+    def __init__(self, start=1000.0):
+        self.value = start
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+def _connected(icon, state, now=None):
+    """A TrayController already marked CONNECTED (so the active/idle print-display
+    path is reachable). Connection status is set directly -- not via the queue --
+    so the helper does not itself enqueue a paint."""
+    if now is None:
+        ctrl = tray.TrayController(icon, state)
+    else:
+        ctrl = tray.TrayController(icon, state, now=now)
+    ctrl._status = ConnectionStatus.CONNECTED
+    return ctrl
+
+
 # --- Task 1: marshalling + debounce ----------------------------------------
 
 
@@ -66,7 +94,7 @@ def test_pump_once_applies_icon_and_title():
     """pump_once on the UI thread drains the queue and paints exactly once."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -91,7 +119,7 @@ def test_debounce_same_value_paints_once():
     repaint after pumping."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -106,7 +134,7 @@ def test_percent_change_triggers_repaint():
     is part of the debounce key."""
     icon = FakeIcon()
     state = _active(41, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -121,7 +149,7 @@ def test_minute_change_triggers_repaint():
     """A change that crosses the shown minute DOES repaint."""
     icon = FakeIcon()
     state = _active(42, 84)  # "1:24"
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -137,7 +165,7 @@ def test_sub_minute_change_with_same_display_does_not_repaint():
     (icon_text only collapses to whole minutes, but here both are unchanged)."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -149,10 +177,19 @@ def test_sub_minute_change_with_same_display_does_not_repaint():
 
 
 def test_idle_state_paints_neutral():
-    """Applying an idle state sets the tooltip to 'Geen actieve print'."""
+    """Applying an idle state (connected + fresh report) sets the tooltip to
+    'Geen actieve print'."""
     icon = FakeIcon()
-    state = PrintState(gcode_state="IDLE", mc_percent=0, mc_remaining_time=0)
-    ctrl = tray.TrayController(icon, state)
+    clock = _FakeClock()
+    # Fresh report (last_update == now) so idle derives NO_ACTIVE_PRINT, not
+    # PRINTER_OFFLINE.
+    state = PrintState(
+        gcode_state="IDLE",
+        mc_percent=0,
+        mc_remaining_time=0,
+        last_update_monotonic=clock.value,
+    )
+    ctrl = _connected(icon, state, now=clock)
 
     ctrl.on_state_change()
     ctrl.pump_once()
@@ -166,7 +203,7 @@ def test_pump_coalesces_multiple_enqueued_requests():
     reflecting the LATEST request when pump_once drains them together."""
     icon = FakeIcon()
     state = _active(40, 90)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()  # 40 / 90
     state.mc_percent = 41
@@ -187,7 +224,7 @@ def test_reassert_paints_even_when_key_unchanged():
     the tray icon is recreated (e.g. TaskbarCreated / Explorer restart)."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.on_state_change()
     ctrl.pump_once()  # paint #1, baseline now set
@@ -202,7 +239,7 @@ def test_reassert_resets_debounce_baseline():
     NOT double-paint -- reassert resets the baseline to the current state."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.reassert()  # paint #1, baseline = current (42, "1:23")
     ctrl.on_state_change()  # identical value
@@ -214,7 +251,7 @@ def test_reassert_resets_debounce_baseline():
 def test_reassert_from_cold_paints_once():
     """reassert() works as the FIRST paint at startup (no prior pump)."""
     icon = FakeIcon()
-    ctrl = tray.TrayController(icon, _active(42, 83))
+    ctrl = _connected(icon, _active(42, 83))
 
     ctrl.reassert()
 
@@ -227,7 +264,7 @@ def test_build_setup_makes_visible_and_paints():
     and performs an initial reassert (so the icon shows immediately on launch)."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     setup = ctrl.build_setup()
     setup(icon)
@@ -242,7 +279,7 @@ def test_build_setup_no_double_paint_on_first_real_change():
     same displayed value does NOT repaint (baseline was reset by reassert)."""
     icon = FakeIcon()
     state = _active(42, 83)
-    ctrl = tray.TrayController(icon, state)
+    ctrl = _connected(icon, state)
 
     ctrl.build_setup()(icon)  # initial paint, baseline set
     ctrl.on_state_change()  # same value
@@ -261,7 +298,7 @@ def test_build_setup_tolerates_icon_without_visible_attr():
             self.title = None
 
     icon = MinimalIcon()
-    ctrl = tray.TrayController(icon, _active(42, 83))
+    ctrl = _connected(icon, _active(42, 83))
 
     ctrl.build_setup()(icon)  # must not raise
 

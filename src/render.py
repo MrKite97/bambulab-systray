@@ -176,4 +176,10 @@ def tooltip_for_display_state(display_state: "DisplayState", state: PrintState) 
 
 # Imported for type/grep visibility; the cycle-safe runtime imports are local
 # inside the functions above (status.py imports is_active_print from this module).
-from src.status import DisplayState  # noqa: E402,F401
+# Guarded so render stays importable regardless of import order: when status is
+# imported first it is still mid-initialization here (DisplayState not yet bound),
+# which must not hard-fail -- the real uses are the local imports above.
+try:  # pragma: no cover - import-order guard
+    from src.status import DisplayState  # noqa: E402,F401
+except ImportError:  # status still initializing (status -> render -> status cycle)
+    pass
