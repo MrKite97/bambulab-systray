@@ -33,8 +33,11 @@ class PrintState:
     ``layer_num`` / ``total_layer_num`` (current/total layer) and
     ``gcode_file`` / ``subtask_name`` (the print file name, stored as the
     BASENAME for display -- directory components are stripped, the extension is
-    kept). All follow the SAME None-guarded "missing delta = unchanged" rule as
-    ``mc_remaining_time`` so partial P1/A1 reports never reset them to 0/"".
+    kept), plus nozzle/bed temperatures: ``nozzle_temper`` /
+    ``nozzle_target_temper`` and ``bed_temper`` / ``bed_target_temper`` (current
+    and target degrees C, stored as floats as delivered). All follow the SAME
+    None-guarded "missing delta = unchanged" rule as ``mc_remaining_time`` so
+    partial P1/A1 reports never reset them to 0/0.0/"".
     """
 
     gcode_state: str = "unknown"
@@ -44,6 +47,10 @@ class PrintState:
     total_layer_num: int = 0
     gcode_file: str = ""  # basename only (path stripped, extension kept)
     subtask_name: str = ""  # basename only (path stripped, extension kept)
+    nozzle_temper: float = 0.0  # current nozzle temperature, degrees C
+    nozzle_target_temper: float = 0.0  # target nozzle temperature, degrees C
+    bed_temper: float = 0.0  # current bed temperature, degrees C
+    bed_target_temper: float = 0.0  # target bed temperature, degrees C
     last_update_monotonic: float = 0.0
 
     def merge(self, print_obj: dict) -> None:
@@ -69,6 +76,18 @@ class PrintState:
         v = print_obj.get("subtask_name")
         if v is not None:
             self.subtask_name = _basename(v)
+        v = print_obj.get("nozzle_temper")
+        if v is not None:
+            self.nozzle_temper = v
+        v = print_obj.get("nozzle_target_temper")
+        if v is not None:
+            self.nozzle_target_temper = v
+        v = print_obj.get("bed_temper")
+        if v is not None:
+            self.bed_temper = v
+        v = print_obj.get("bed_target_temper")
+        if v is not None:
+            self.bed_target_temper = v
         self.last_update_monotonic = time.monotonic()
 
 
