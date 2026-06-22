@@ -619,17 +619,19 @@ def build_gui(
     _holder = {"controller": None}
 
     def _state_provider():
+        # The page seed (get_initial_state) opens LOGGED-OUT on start; the
+        # SessionController's bootstrap_from_stored / login flow drives the real
+        # logged-in state to the page via push_state/push_auth_step afterwards.
         ctrl = _holder["controller"]
         connection = (
             getattr(ctrl, "_status", ConnectionStatus.DISCONNECTED)
             if ctrl is not None
             else ConnectionStatus.DISCONNECTED
         )
-        logged_in = getattr(ctrl, "_status", None) is not None and _holder.get("logged_in", False)
         return bridge.serialize_state(
             state,
             connection,
-            logged_in=_holder.get("logged_in", False),
+            logged_in=False,
             theme=render.detect_windows_theme(),
         )
 
