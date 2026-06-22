@@ -102,9 +102,38 @@ def test_token_never_written_to_disk(appdata_tmp):
 
 
 def test_settings_does_not_call_token_store():
-    """settings.py must not import or call token_store/keyring (token stays out)."""
+    """settings.py must not import or call token_store/keyring (token stays out).
+
+    We assert on the actual code -- imports and calls -- not on prose: docstrings
+    are stripped before scanning so an explanatory comment cannot trip the check.
+    """
+    import ast
     import inspect
 
-    src = inspect.getsource(settings)
-    assert "token_store" not in src
-    assert "keyring" not in src
+    tree = ast.parse(inspect.getsource(settings))
+
+    # No import of token_store or keyring anywhere.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "token_store" not in alias.name
+                assert "keyring" not in alias.name
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            assert "token_store" not in mod
+            assert "keyring" not in mod
+
+    # Strip docstrings, then assert no token call-site survives in the code.
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                node.body = node.body[1:]
+    code_no_docs = ast.unparse(tree)
+    assert "save_token" not in code_no_docs
+    assert "load_token" not in code_no_docs
+    assert "access_token" not in code_no_docs
