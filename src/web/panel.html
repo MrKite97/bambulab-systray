@@ -580,8 +580,18 @@
     var primaryLabel = (status === "printing") ? "Pauzeren"
       : (status === "paused") ? "Hervatten"
       : "Opnieuw printen";
-    $("btn-control-primary").textContent = primaryLabel;
-    $("btn-control-primary").style.background = color;
+    var primaryBtn = $("btn-control-primary");
+    primaryBtn.textContent = primaryLabel;
+    primaryBtn.style.background = color;
+
+    // The primary control only has a real cloud command while printing (pause)
+    // or paused (resume). For done/error/idle the label is "Opnieuw printen" but
+    // there is NO cloud reprint command -- so DISABLE the button (honest: it
+    // publishes nothing) rather than fake a reprint. (CONTEXT LOCKED, T-09-08)
+    var primaryActive = (status === "printing") || (status === "paused");
+    primaryBtn.disabled = !primaryActive;
+    primaryBtn.style.opacity = primaryActive ? "" : "0.45";
+    primaryBtn.style.cursor = primaryActive ? "pointer" : "default";
   }
 
   // expose Python -> page entry points
@@ -637,7 +647,14 @@
     // controls -> control(command)
     $("btn-control-primary").addEventListener("click", function () {
       if (!hasApi()) { return; }
-      var cmd = (current.status === "printing") ? "pause" : "resume";
+      // Only printing->pause and paused->resume publish a command. For any other
+      // status (done/error/idle, the "Opnieuw printen" case) return WITHOUT
+      // calling the api -- there is NO cloud reprint command, so never fake one.
+      // (Defense-in-depth: the button is also disabled for these statuses.)
+      var cmd = (current.status === "printing") ? "pause"
+        : (current.status === "paused") ? "resume"
+        : null;
+      if (cmd === null) { return; }
       window.pywebview.api.control(cmd);
     });
     $("btn-control-cancel").addEventListener("click", function () {
