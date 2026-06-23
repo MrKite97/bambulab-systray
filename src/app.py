@@ -1181,14 +1181,23 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     # the neutral/logged-out frame.
     icon.icon = render.render_icon(None)
 
-    # Decide logged-in vs login screen from the stored token + serial. A validated
-    # stored session starts MQTT (via start_mqtt) and opens on progress; a
-    # rejected/absent token resets the panel to the login screen.
-    session.bootstrap_from_stored()
+    # Defer the bootstrap + initial show to the window's DOM-loaded event. Both
+    # push to the page (push_auth_step / evaluate_js) and SHOW the window, which
+    # is only safe AFTER webview.start() is running and the page DOM is ready --
+    # calling them eagerly here raises "Main window failed to start" (the v2
+    # startup crash). pywebview fires window.events.loaded at exactly that point.
+    def _on_window_loaded():
+        # Runs after the GUI loop is up and the page DOM is loaded, so
+        # bootstrap_from_stored's push_* and flyout.show() are now safe.
+        # Decide logged-in vs login screen from the stored token + serial: a
+        # validated stored session starts MQTT (via start_mqtt) and opens on
+        # progress; a rejected/absent token resets the panel to the login screen.
+        session.bootstrap_from_stored()
+        # Show the flyout so the login screen is visible when logged out (the
+        # user logs in entirely in the panel -- no console prompt).
+        flyout.show()
 
-    # Show the flyout on start so the login screen is visible when logged out (the
-    # user logs in entirely in the panel -- no console prompt).
-    flyout.show()
+    flyout.on_loaded(_on_window_loaded)
 
     # v2 threading inversion: the tray runs on its OWN thread (run_detached) so
     # the MAIN thread is free to run webview.start(). make_setup paints the first

@@ -15,6 +15,29 @@ from src.bridge import Api
 from src.flyout import FlyoutWindow
 
 
+class FakeEvent:
+    """Tiny stand-in for a pywebview Event: supports ``+=`` (append a callback)
+    and a ``fire()`` helper so tests can drive the DOM-loaded callback."""
+
+    def __init__(self):
+        self.callbacks = []
+
+    def __iadd__(self, callback):
+        self.callbacks.append(callback)
+        return self
+
+    def fire(self, *args, **kwargs):
+        for cb in list(self.callbacks):
+            cb(*args, **kwargs)
+
+
+class FakeEvents:
+    """Stand-in for ``window.events`` exposing a fireable ``loaded`` event."""
+
+    def __init__(self):
+        self.loaded = FakeEvent()
+
+
 class FakeWindow:
     def __init__(self):
         self.moved = []
@@ -22,6 +45,7 @@ class FakeWindow:
         self.hidden = 0
         self.evaluated = []
         self.destroyed = 0
+        self.events = FakeEvents()
 
     def move(self, x, y):
         self.moved.append((x, y))
@@ -236,6 +260,43 @@ def test_destroy_before_create_is_noop():
 # --------------------------------------------------------------------------- #
 # lazy webview import + no-secret invariant                                   #
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# on_loaded() DOM-loaded callback registration                                #
+# --------------------------------------------------------------------------- #
+
+
+def test_on_loaded_registers_on_events_loaded():
+    api, fake, fw = _make()
+    fw.create()
+    fired = []
+    fw.on_loaded(lambda: fired.append("loaded"))
+    # Registered on the window's events.loaded but not yet fired.
+    assert fake.window.events.loaded.callbacks  # callback registered
+    assert fired == []
+    # Firing the loaded event runs the callback.
+    fake.window.events.loaded.fire()
+    assert fired == ["loaded"]
+
+
+def test_on_loaded_before_create_is_noop():
+    api, fake, fw = _make()
+    # no create() -> no window yet; registering must not raise and do nothing.
+    fw.on_loaded(lambda: None)
+    assert fake.window.events.loaded.callbacks == []
+
+
+def test_on_loaded_noop_when_window_has_no_events():
+    api, fake, fw = _make()
+    fw.create()
+
+    class NoEventsWindow:
+        pass
+
+    # Simulate a backend/fake window that exposes no events hub.
+    fw._window = NoEventsWindow()
+    fw.on_loaded(lambda: None)  # must not raise
 
 
 def test_module_imports_without_pywebview():

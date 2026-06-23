@@ -156,6 +156,28 @@ class FlyoutWindow:
         self._window = None
         self.visible = False
 
+    def on_loaded(self, callback):
+        """Register a callback to run once the window's DOM has loaded.
+
+        pywebview fires ``window.events.loaded`` AFTER ``webview.start()`` is
+        running and the page DOM is ready, which is the earliest point at which
+        ``evaluate_js`` / the ``push_*`` paths / :meth:`show` are safe. Calling
+        any of those before that point raises "Main window failed to start"
+        (the v2 startup crash this guards against).
+
+        No-op when there is no window yet, or when the backend exposes no
+        ``events`` (e.g. a test fake without an event hub). The real pywebview
+        ``Event`` supports ``+=`` (``__iadd__`` returns the event), so we assign
+        the result back to keep both real and fake events working.
+        """
+        if self._window is None:
+            return
+        events = getattr(self._window, "events", None)
+        loaded = getattr(events, "loaded", None)
+        if loaded is None:
+            return
+        self._window.events.loaded += callback
+
     # --- Python -> page pushes (json.dumps-escaped, no secret) ------------- #
 
     def _evaluate(self, code: str):

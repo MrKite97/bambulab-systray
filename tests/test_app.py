@@ -907,6 +907,7 @@ class RecordingFlyout:
     def __init__(self):
         self.events = []
         self.visible = False
+        self.loaded_callbacks = []
 
     def hide(self):
         self.events.append("hide")
@@ -925,6 +926,16 @@ class RecordingFlyout:
 
     def push_theme(self, theme):
         self.events.append(("push_theme", theme))
+
+    def on_loaded(self, callback):
+        # Record + store the DOM-loaded callback so tests can fire it to simulate
+        # pywebview's window.events.loaded after webview.start().
+        self.events.append("on_loaded")
+        self.loaded_callbacks.append(callback)
+
+    def fire_loaded(self):
+        for cb in list(self.loaded_callbacks):
+            cb()
 
 
 def test_quit_handler_destroys_flyout_before_icon_stop():
@@ -1209,7 +1220,13 @@ def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
     assert fake_icon.run_count == 0
     # The MAIN thread entered the GUI loop.
     assert fake_webview.start_calls == 1
-    # main() bootstrapped from the stored token instead of prompting the console.
+    # Bootstrap is DEFERRED to the DOM-loaded event: it must NOT have run before
+    # webview.start() (that ordering caused "Main window failed to start").
+    assert "bootstrap_from_stored" not in session.calls
+    assert "on_loaded" in flyout.events
+    # Firing the loaded event (pywebview's window.events.loaded after start)
+    # bootstraps from the stored token instead of prompting the console.
+    flyout.fire_loaded()
     assert "bootstrap_from_stored" in session.calls
 
 
@@ -1248,9 +1265,15 @@ def test_main_logged_out_start_sets_neutral_glyph_and_shows_flyout(monkeypatch):
     rc = app.main(argv=[], guard=OkGuard(), webview=fake_webview)
 
     assert rc == 0
-    # The icon shows the neutral logged-out glyph (render_icon(None)).
+    # The icon shows the neutral logged-out glyph (render_icon(None)). This is set
+    # before start (it does NOT touch the web page, so it is safe pre-start).
     assert fake_icon.icon is neutral
-    # The flyout was shown so the login screen is visible.
+    # The show is DEFERRED to the DOM-loaded event -- showing the window before
+    # webview.start() raised "Main window failed to start".
+    assert "show" not in flyout.events
+    assert "on_loaded" in flyout.events
+    # Firing the loaded event shows the flyout so the login screen is visible.
+    flyout.fire_loaded()
     assert "show" in flyout.events
 
 
