@@ -45,6 +45,44 @@ def test_resource_path_not_frozen_ignores_meipass(monkeypatch):
     assert "should" not in p
 
 
+# --- panel.html resolution (bundled flyout HTML, dev <-> frozen contract) ---
+
+
+def test_resource_path_resolves_panel_html_from_source():
+    """Run-from-source: resource_path("src/web/panel.html") returns an absolute
+    path that exists on disk and ends with src/web/panel.html (the page the
+    WebView2 backend loads)."""
+    p = resource_path("src/web/panel.html")
+    assert os.path.isabs(p)
+    assert os.path.exists(p)
+    assert p.replace("\\", "/").endswith("src/web/panel.html")
+
+
+def test_resource_path_panel_html_frozen_matches_spec_destination(monkeypatch):
+    """When frozen, resource_path("src/web/panel.html") == _MEIPASS/src/web/panel.html.
+
+    This is exactly the directory the spec's datas tuple
+    ('src/web/panel.html', 'src/web') extracts to, so the bundled file and the
+    runtime lookup path agree. A wrong spec destination would fail this and
+    surface as a blank flyout window.
+    """
+    fake_meipass = os.path.join("C", "tmp", "_MEI12345")
+    monkeypatch.setattr("sys.frozen", True, raising=False)
+    monkeypatch.setattr("sys._MEIPASS", fake_meipass, raising=False)
+    p = resource_path("src/web/panel.html")
+    assert p == os.path.join(fake_meipass, "src", "web", "panel.html")
+
+
+def test_panel_file_url_points_at_bundled_panel():
+    """flyout._panel_file_url() builds a file:/// URL that ends with the bundled
+    panel.html -- the page the WebView2 backend actually renders."""
+    from src.flyout import _panel_file_url
+
+    url = _panel_file_url()
+    assert url.startswith("file:///")
+    assert url.endswith("src/web/panel.html")
+
+
 # --- appdata_dir -----------------------------------------------------------
 
 
