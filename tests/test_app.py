@@ -1346,15 +1346,161 @@ def test_make_bridge_handlers_wires_session_methods():
     assert ("select_printer", "DEV1") in session.calls
     assert ("logout",) in session.calls
 
-    # 'control' is still a NAME-only stub this phase (Phase 9 wires it).
+    # 'control' is now a REAL handler (Phase 9 wired it to control.publish_command),
+    # not a SessionController method and not a name-only stub.
     assert handlers["control"] is not getattr(session, "control", None)
     assert callable(handlers["control"])
 
 
-def test_stub_actions_only_control_remaining():
-    """The remaining stubbed action is 'control' alone -- login/select/logout are
-    now real SessionController methods, not stubs."""
-    assert app._STUB_ACTIONS == ("control",)
+def test_stub_actions_empty_after_control_wired():
+    """No page action is a name-only stub anymore: Phase 9 replaced the last
+    'control' stub with a real handler that publishes pause/resume/stop."""
+    assert app._STUB_ACTIONS == ()
+
+
+# --- Plan 09-02: Api.control -> control.publish_command wiring -------------- #
+
+
+class _FakeControlModule:
+    """A fake stand-in for src.control: records publish_command(client, serial,
+    command) calls and enforces the SAME closed allowlist so an out-of-allowlist
+    command raises (proving the handler never bypasses validation -- T-09-05)."""
+
+    _ALLOWED = ("pause", "resume", "stop")
+
+    def __init__(self):
+        self.calls = []
+
+    def publish_command(self, client, serial, command):
+        if command not in self._ALLOWED:
+            raise ValueError(f"Unsupported control command: {command!r}")
+        self.calls.append((client, serial, command))
+
+
+def _control_handler_with(start_mqtt_attrs):
+    """Build a control handler over a stand-in start_mqtt carrying the given
+    attributes (client/serial), with an injected fake control module. Returns
+    (handler, fake_control)."""
+
+    class _StartMqtt:
+        pass
+
+    start_mqtt = _StartMqtt()
+    for name, value in start_mqtt_attrs.items():
+        setattr(start_mqtt, name, value)
+    fake_control = _FakeControlModule()
+    handler = app.make_control_handler(start_mqtt, control=fake_control)
+    return handler, fake_control
+
+
+def test_control_handler_publishes_each_allowlisted_command():
+    """Driving the control handler with pause/resume/stop (after a session set
+    client+serial) calls control.publish_command(client, serial, command) for
+    each -- the panel button -> publish_command mapping (PANEL-02)."""
+    client = object()
+    for command in ("pause", "resume", "stop"):
+        handler, fake_control = _control_handler_with(
+            {"client": client, "serial": "SER-OWN"}
+        )
+        handler(command)
+        assert fake_control.calls == [(client, "SER-OWN", command)]
+
+
+def test_control_handler_targets_the_captured_active_serial():
+    """The handler targets the user's OWN selected serial -- the one captured
+    when start_mqtt ran (T-09-06), never a foreign/broadcast serial."""
+    client = object()
+    handler, fake_control = _control_handler_with(
+        {"client": client, "serial": "MY-PRINTER"}
+    )
+    handler("pause")
+    assert fake_control.calls == [(client, "MY-PRINTER", "pause")]
+
+
+def test_control_handler_rejects_out_of_allowlist_command(caplog):
+    """An out-of-allowlist command ('home'/'gcode') never reaches the broker:
+    publish_command is never recorded with it and the bridge thread does not
+    crash (T-09-05). The command value is never logged."""
+    import logging
+
+    client = object()
+    handler, fake_control = _control_handler_with(
+        {"client": client, "serial": "SER-OWN"}
+    )
+    with caplog.at_level(logging.DEBUG, logger="app"):
+        # Must not raise out of the handler (keep the bridge thread alive)...
+        handler("home")
+        handler("gcode")
+    # ...and must NOT have published either arbitrary command.
+    assert fake_control.calls == []
+    # The arbitrary command value is never logged.
+    assert "home" not in caplog.text
+    assert "gcode" not in caplog.text
+
+
+def test_control_handler_is_noop_with_no_session():
+    """With no session started (client/serial still None) the control handler is
+    a safe no-op: publish_command is never called and nothing is raised."""
+    handler, fake_control = _control_handler_with({"client": None, "serial": None})
+    assert handler("pause") is None
+    assert fake_control.calls == []
+
+    # Also a no-op when the attributes are entirely absent (defensive getattr).
+    class _Bare:
+        pass
+
+    fake_control2 = _FakeControlModule()
+    bare_handler = app.make_control_handler(_Bare(), control=fake_control2)
+    assert bare_handler("stop") is None
+    assert fake_control2.calls == []
+
+
+def test_make_start_mqtt_captures_active_serial(monkeypatch):
+    """When start_mqtt runs it stores the serial it was started with on
+    start_mqtt.serial (alongside start_mqtt.client) so control targets the
+    user's OWN device (T-09-06)."""
+    gui, _ = _build_gui(monkeypatch)
+    start_mqtt = gui["start_mqtt"]
+
+    start_mqtt("TOKEN", "SER-ACTIVE")
+
+    assert start_mqtt.serial == "SER-ACTIVE"
+    assert start_mqtt.client is not None
+
+
+def test_build_app_eager_path_captures_active_serial(monkeypatch):
+    """The eager build_app path also records the derived serial on
+    start_mqtt.serial so control works without a deferred start (mirrors how
+    start_mqtt.client is set eagerly)."""
+    _patch_build_app(monkeypatch)
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+    start_mqtt = result["start_mqtt"]
+    assert start_mqtt.serial is not None
+    assert start_mqtt.serial == start_mqtt.client._serial if hasattr(
+        start_mqtt.client, "_serial"
+    ) else start_mqtt.serial is not None
+
+
+def test_bridge_control_handler_publishes_via_build_app(monkeypatch):
+    """End-to-end through the bridge: api.control('pause') on a built app calls
+    control.publish_command with the captured active client+serial. The control
+    module is patched so no real broker is touched."""
+    _patch_build_app(monkeypatch)
+
+    published = []
+    monkeypatch.setattr(
+        app.control,
+        "publish_command",
+        lambda client, serial, command: published.append((serial, command)),
+    )
+
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+    api = result["api"]
+    start_mqtt = result["start_mqtt"]
+
+    api.control("pause")
+
+    assert published == [(start_mqtt.serial, "pause")]
 
 
 def test_make_session_builds_real_controller():
