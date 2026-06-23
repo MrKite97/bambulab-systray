@@ -246,6 +246,154 @@ def test_on_message_bad_payload_does_not_raise():
     assert controller.signal_count == 1
 
 
+# --- Plan 09-01: live-push of serialized state to the flyout ----------------
+
+
+class RecordingPushFlyout:
+    """Stand-in for FlyoutWindow recording every push_state(dict) call so the
+    live-push wiring (serialize-and-push on report + throttle + re-push on show)
+    is assertable with NO real GUI/broker. ``visible`` is settable so the
+    show/hide branches of the toggle can be driven."""
+
+    def __init__(self, visible=False):
+        self.visible = visible
+        self.pushes = []        # every state dict pushed to the page
+        self.themes = []        # every theme pushed
+        self.events = []        # ordered call log (toggle/show/hide)
+
+    def push_state(self, state):
+        self.pushes.append(state)
+
+    def push_theme(self, theme):
+        self.themes.append(theme)
+        self.events.append(("push_theme", theme))
+
+    def show(self):
+        self.events.append("show")
+        self.visible = True
+
+    def hide(self):
+        self.events.append("hide")
+        self.visible = False
+
+    def toggle(self):
+        self.events.append("toggle")
+        self.visible = not self.visible
+
+
+def _report(**fields):
+    """Build a FakeMsg carrying a JSON ``{"print": {...}}`` report delta."""
+    return FakeMsg(json.dumps({"print": fields}))
+
+
+def test_on_message_pushes_serialized_state_to_flyout(monkeypatch):
+    """A report that changes a displayed field is merged AND its serialized state
+    is pushed to the flyout, with pct/etaLabel/status reflecting the merge."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    controller = FakeController()
+    flyout = RecordingPushFlyout()
+    state = PrintState()
+
+    on_message = app.make_on_message(
+        controller, flyout=flyout, state=state, printer_name="MyP1"
+    )
+    userdata = {"serial": "S", "state": state}
+    on_message(
+        client=None,
+        userdata=userdata,
+        msg=_report(mc_percent=42, gcode_state="RUNNING", mc_remaining_time=83),
+    )
+
+    assert controller.signal_count == 1  # tray repaint still enqueued
+    assert len(flyout.pushes) == 1
+    pushed = flyout.pushes[0]
+    assert pushed["pct"] == 42
+    assert pushed["status"] == "printing"
+    assert pushed["etaLabel"] == "nog 1 u 23 min"  # MINUTES -> ETA, not regressed
+    assert pushed["printerName"] == "MyP1"
+
+
+def test_on_message_without_flyout_still_signals(monkeypatch):
+    """make_on_message stays backward-compatible: with no flyout it merges +
+    signals exactly as before and never tries to push."""
+    controller = FakeController()
+    on_message = app.make_on_message(controller)  # no flyout (v1 path)
+    state = PrintState()
+    userdata = {"serial": "S", "state": state}
+
+    on_message(client=None, userdata=userdata, msg=_report(mc_percent=7, gcode_state="RUNNING"))
+
+    assert state.mc_percent == 7
+    assert controller.signal_count == 1
+
+
+def test_on_message_throttles_identical_reports(monkeypatch):
+    """Rapid IDENTICAL reports (no displayed field changed) push to the flyout
+    FEWER times than the number of reports -- the throttle coalesces them."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    controller = FakeController()
+    flyout = RecordingPushFlyout()
+    state = PrintState()
+    on_message = app.make_on_message(controller, flyout=flyout, state=state)
+    userdata = {"serial": "S", "state": state}
+
+    msg = _report(mc_percent=10, gcode_state="RUNNING", mc_remaining_time=30)
+    for _ in range(5):
+        on_message(client=None, userdata=userdata, msg=msg)
+
+    # The throttle suppressed the redundant identical pushes.
+    assert len(flyout.pushes) < 5
+    assert len(flyout.pushes) == 1  # only the first (changed) report pushed
+
+
+def test_on_message_terminal_state_always_pushed(monkeypatch):
+    """A report flipping gcode_state to FINISH (status 'done') is ALWAYS pushed,
+    even when the throttle would otherwise suppress it -- terminal state is never
+    silently dropped (security_note T-09-04)."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    controller = FakeController()
+    flyout = RecordingPushFlyout()
+    state = PrintState()
+    on_message = app.make_on_message(controller, flyout=flyout, state=state)
+    userdata = {"serial": "S", "state": state}
+
+    # First, a steady RUNNING report (pushed once, sets the throttle baseline).
+    on_message(client=None, userdata=userdata,
+               msg=_report(mc_percent=100, gcode_state="RUNNING", mc_remaining_time=0))
+    pushes_before = len(flyout.pushes)
+
+    # Now flip to FINISH. Even if pct/eta are unchanged, the terminal transition
+    # must push.
+    on_message(client=None, userdata=userdata,
+               msg=_report(gcode_state="FINISH"))
+
+    assert len(flyout.pushes) == pushes_before + 1
+    assert flyout.pushes[-1]["status"] == "done"
+
+
+def test_on_message_does_not_block_on_evaluate_js(monkeypatch):
+    """The push is fire-and-forget: make_on_message never gates the network thread
+    on a push_state return value, and a push_state that raises must not crash the
+    callback thread (the report merge + signal still complete)."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    controller = FakeController()
+    state = PrintState()
+
+    class RaisingFlyout(RecordingPushFlyout):
+        def push_state(self, s):
+            raise RuntimeError("page JS blew up")
+
+    on_message = app.make_on_message(controller, flyout=RaisingFlyout(), state=state)
+    userdata = {"serial": "S", "state": state}
+
+    # Must not raise out of the network callback even though push_state raises.
+    on_message(client=None, userdata=userdata,
+               msg=_report(mc_percent=5, gcode_state="RUNNING"))
+
+    assert state.mc_percent == 5          # merge still happened
+    assert controller.signal_count == 1   # tray signal still fired
+
+
 # --- build_app with no network ----------------------------------------------
 
 

@@ -109,20 +109,102 @@ def persist_serial(serial, *, settings=settings_module):
     settings.save_settings({**settings.load_settings(), "serial": serial})
 
 
-def make_on_message(controller):
+# The set of serialized ``status`` values that are TERMINAL: a transition into
+# either must ALWAYS be pushed to the panel, bypassing the throttle, so a
+# finished/failed print is never silently dropped (T-09-04).
+_TERMINAL_STATUSES = ("done", "error")
+
+# The serialized keys that constitute a "displayed-field change": when none of
+# these changed since the last push the report is throttled (T-09-03). Chosen so
+# every value the panel actually renders is covered.
+_DISPLAYED_KEYS = (
+    "status", "pct", "etaLabel", "layer", "totalLayer", "file",
+    "nozzle", "nozzleTarget", "bed", "bedTarget",
+)
+
+
+def _display_signature(serialized: dict) -> tuple:
+    """A hashable tuple of the panel-displayed fields used to throttle pushes."""
+    return tuple(serialized.get(k) for k in _DISPLAYED_KEYS)
+
+
+def make_on_message(
+    controller,
+    *,
+    flyout=None,
+    state=None,
+    connection_provider=None,
+    printer_name="",
+):
     """Wrap ``mqtt_client.on_message`` so each report BOTH merges the delta into
-    the shared PrintState AND signals the controller to (eventually) repaint.
+    the shared PrintState AND signals the controller to (eventually) repaint --
+    and, when a ``flyout`` is wired (Plan 09-01), ALSO pushes the freshly-merged,
+    serialized state to the panel (THROTTLED, terminal-state-safe).
 
     The wrapper runs on the NETWORK (paho) callback thread. It therefore only
     ENQUEUES a repaint via ``controller.on_state_change()`` -- it never mutates
     the icon. ``mqtt_client.on_message`` is already guarded against malformed
     JSON / a missing ``print`` key, and ``on_state_change`` merely puts a key on
     a queue, so a bad broker payload cannot crash this thread (T-02-09).
+
+    Live-push (Plan 09-01, PANEL-01): after the merge + tray signal, the SHARED
+    ``state`` is serialized via :func:`bridge.serialize_state` (secret-free by
+    construction -- T-09-01) and pushed to the panel via ``flyout.push_state``.
+    The push is:
+
+    - THROTTLED (T-09-03): only pushed when a panel-displayed field changed since
+      the last push (compared via :func:`_display_signature`), so a burst of
+      identical reports does not flood ``evaluate_js``.
+    - TERMINAL-SAFE (T-09-04): a transition whose serialized ``status`` is
+      ``done``/``error`` is ALWAYS pushed, even if the throttle would otherwise
+      suppress it, so a FINISH/FAILED is never silently dropped.
+    - FIRE-AND-FORGET: the push never gates the network thread on the page JS
+      return value, and any push failure is swallowed (the merge + tray signal
+      must always complete -- the panel is best-effort).
+
+    ``flyout``/``state`` are optional so the v1 console/tray-only path (no panel)
+    keeps the original merge-and-signal behavior unchanged. ``connection_provider``
+    is an optional zero-arg callable yielding the current
+    :class:`~src.status.ConnectionStatus` to serialize with (defaults to
+    CONNECTED, since a report only arrives over a live session); ``printer_name``
+    is the display name passed through to the serialized dict (default "").
     """
+    # Per-wrapper throttle memory (closed over). Lives on the network thread only,
+    # so no lock is needed -- paho delivers messages serially per client.
+    _last_signature = {"sig": None}
+
+    def _push_live_state():
+        """Serialize the merged shared state and push it to the panel (throttled,
+        terminal-safe, fire-and-forget). Never raises into the callback thread."""
+        try:
+            connection = (
+                connection_provider()
+                if connection_provider is not None
+                else ConnectionStatus.CONNECTED
+            )
+            serialized = bridge.serialize_state(
+                state,
+                connection,
+                logged_in=True,
+                printer_name=printer_name,
+                theme=render.detect_windows_theme(),
+            )
+            signature = _display_signature(serialized)
+            terminal = serialized.get("status") in _TERMINAL_STATUSES
+            # Throttle: skip when nothing the panel shows changed -- UNLESS this is
+            # a terminal transition, which is always pushed (T-09-04).
+            if signature == _last_signature["sig"] and not terminal:
+                return
+            _last_signature["sig"] = signature
+            flyout.push_state(serialized)  # fire-and-forget; no evaluate_js wait
+        except Exception:  # noqa: BLE001 - panel push is best-effort; never crash net thread
+            logger.debug("flyout push_state failed on report; continuing", exc_info=False)
 
     def _on_message(client, userdata, msg):
         mqtt_client.on_message(client, userdata, msg)  # guarded delta-merge
         controller.on_state_change()  # enqueue a repaint (UI thread applies it)
+        if flyout is not None and state is not None:
+            _push_live_state()  # live panel update (throttled, terminal-safe)
 
     return _on_message
 
@@ -453,6 +535,8 @@ def _wire_client(
     relogin_handler,
     connect=None,
     sleep=None,
+    flyout=None,
+    printer_name="",
 ):
     """Build + wire the MQTT client for ``(token, serial)`` and return
     ``(client, network_runner)`` WITHOUT starting any thread.
@@ -461,7 +545,14 @@ def _wire_client(
     status/401 connect wrapper are wired -- reused by both the eager
     :func:`build_app` path and the deferred :func:`make_start_mqtt` hook so the
     WHEN of starting the network thread can move without duplicating the HOW.
-    The token is never logged; only the serial (benign) is."""
+    The token is never logged; only the serial (benign) is.
+
+    Plan 09-01: ``flyout`` (+ ``printer_name``) are threaded into the on_message
+    wrapper so each merged report also pushes the serialized state to the panel
+    (throttled, terminal-safe). When ``flyout`` is None the wrapper keeps the v1
+    merge-and-signal-only behavior. The connection status the panel serializes
+    with is read live off the controller (the same value the tray derives from),
+    so the panel shows CONNECTED/DISCONNECTED consistently with the tray."""
     if sleep is None:
         sleep = time.sleep
 
@@ -475,7 +566,19 @@ def _wire_client(
     # wrapper both merges AND signals the controller.
     client.user_data_set({"serial": serial, "state": state})
     client.on_connect = make_on_connect(controller)
-    client.on_message = make_on_message(controller)
+    # The panel serializes with the controller's live connection status (the same
+    # source the tray uses); a report only flows over a live session so CONNECTED
+    # is the natural default the controller already holds post-connect.
+    def _connection_provider():
+        return getattr(controller, "_status", ConnectionStatus.CONNECTED)
+
+    client.on_message = make_on_message(
+        controller,
+        flyout=flyout,
+        state=state,
+        connection_provider=_connection_provider,
+        printer_name=printer_name,
+    )
     client.on_disconnect = make_on_disconnect(controller)
 
     if connect is None:
@@ -503,6 +606,8 @@ def make_start_mqtt(
     relogin_handler,
     connect=None,
     sleep=None,
+    flyout=None,
+    printer_name="",
 ):
     """Build the deferred ``start_mqtt(token, serial)`` hook (Plan 08-02).
 
@@ -530,6 +635,8 @@ def make_start_mqtt(
             relogin_handler=relogin_handler,
             connect=connect,
             sleep=sleep,
+            flyout=start_mqtt.flyout,
+            printer_name=start_mqtt.printer_name,
         )
         start_mqtt.client = client
         # Bind the live client into the relogin routine so the menu/401 path can
@@ -543,6 +650,11 @@ def make_start_mqtt(
     start_mqtt.started = False
     start_mqtt.client = None
     start_mqtt.controller = controller  # late-bindable (build_gui sets it later)
+    # Late-bindable panel wiring (Plan 09-01): the on_message wrapper pushes the
+    # serialized state to this flyout on each report. build_gui passes the flyout
+    # at construction; both stay overridable before the session starts.
+    start_mqtt.flyout = flyout
+    start_mqtt.printer_name = printer_name
     return start_mqtt
 
 
@@ -658,6 +770,7 @@ def build_gui(
         relogin_handler=relogin_handler,
         connect=connect,
         sleep=sleep,
+        flyout=flyout,  # Plan 09-01: on_message pushes serialized state here
     )
     stop_session = make_stop_session(shutdown_event, start_mqtt)
 
@@ -832,6 +945,7 @@ def build_app(
         relogin_handler=relogin_handler,
         connect=connect,
         sleep=sleep,
+        flyout=gui["flyout"],  # Plan 09-01: live-push serialized state to panel
     )
     # Bind the live client into the relogin routine + the deferred start_mqtt hook
     # so the menu/401 disconnect targets it and start_mqtt won't build a second.
