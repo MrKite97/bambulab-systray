@@ -47,6 +47,7 @@ from src import (
     auth,
     autostart,
     bridge,
+    control,
     mqtt_client,
     render,
     settings as settings_module,
@@ -425,15 +426,17 @@ def make_connect(shutdown_event):
 #
 # Phase 8 wires the panel auth/select actions to the REAL SessionController
 # (src.session). The five page actions (login_submit/submit_code/resend_code/
-# select_printer/logout) now drive the real auth/token_store/settings flow; only
-# ``control`` stays a stub this phase (Phase 9 wires it to control.py). The
-# SessionController is the single brain: it logs nothing sensitive and pushes only
-# secret-free state to the page (T-08-08). ``serialize_state`` (Plan 07-02)
-# guarantees the pushed state carries no secret.
+# select_printer/logout) now drive the real auth/token_store/settings flow; Phase 9
+# (Plan 09-02) replaces the last ``control`` stub with the real control handler
+# (Api.control -> control.publish_command). The SessionController is the single
+# brain: it logs nothing sensitive and pushes only secret-free state to the page
+# (T-08-08). ``serialize_state`` (Plan 07-02) guarantees the pushed state carries
+# no secret.
 
-# The page-action method names still served by a NAME-only stub. After Phase 8
-# only ``control`` remains a stub (the auth/select actions are real now).
-_STUB_ACTIONS = ("control",)
+# The page-action method names still served by a NAME-only stub. After Phase 9
+# (Plan 09-02) wired ``control`` to ``control.publish_command``, NO action remains
+# a stub -- this stays as an (empty) extension point only.
+_STUB_ACTIONS = ()
 
 
 def _make_stub_action(name):
@@ -449,6 +452,54 @@ def _make_stub_action(name):
         return None
 
     return _stub
+
+
+def make_control_handler(start_mqtt, *, control=control):
+    """Build the REAL ``control(command)`` bridge handler (Plan 09-02, PANEL-02).
+
+    The returned callable is the Python side of the panel's pause/resume/cancel
+    buttons: it publishes the command to the printer via
+    ``control.publish_command(active_client, active_serial, command)`` using the
+    live MQTT client + serial captured when the session started (``start_mqtt``
+    stores them on ``.client`` / ``.serial``). The handler therefore ALWAYS
+    targets the user's OWN selected device -- never a broadcast or third-party
+    serial (T-09-06).
+
+    Security / robustness invariants:
+
+    - The closed allowlist (pause/resume/stop) is enforced inside
+      ``control.publish_command`` BEFORE any publish, so an out-of-allowlist
+      command never reaches ``device/<serial>/request`` (T-09-05). The handler
+      does NOT bypass it.
+    - A rejected command (``ValueError``) is swallowed here so a bad page payload
+      can never crash the bridge thread -- it is NOT published either way.
+    - When no session is active yet (no client/serial captured) the handler is a
+      safe no-op: it returns ``None`` WITHOUT publishing and WITHOUT logging the
+      command value (T-09-07).
+    - The command value is never logged here; ``control.py`` logs only the
+      command name + topic at debug. The client/token internals are never logged.
+
+    ``control`` is injectable so tests drive the mapping with a fake module (no
+    real broker)."""
+
+    def _control(command):
+        client = getattr(start_mqtt, "client", None)
+        serial = getattr(start_mqtt, "serial", None)
+        # No live session yet -> safe no-op (never log the command value).
+        if client is None or serial is None:
+            return None
+        try:
+            control.publish_command(client, serial, command)
+        except ValueError:
+            # Out-of-allowlist command: rejected INSIDE publish_command before any
+            # publish (T-09-05). Swallow so a bad page payload never crashes the
+            # bridge thread; never log the command value.
+            logger.debug("control: rejected non-allowlisted command")
+        except Exception:  # noqa: BLE001 - a publish failure must not crash the bridge
+            logger.debug("control: publish_command failed; continuing")
+        return None
+
+    return _control
 
 
 def make_session(
@@ -485,15 +536,21 @@ def make_session(
     return SessionController(**kwargs)
 
 
-def make_bridge_handlers(flyout, session):
+def make_bridge_handlers(flyout, session, *, start_mqtt=None):
     """Build the js_api handler mapping wiring the panel to the SessionController.
 
     ``hide`` stays the real ``flyout.hide`` (click-away / tray toggle); the five
     auth/select actions forward to the injected ``session``'s BOUND methods
     (login_submit/submit_code/resend_code/select_printer/logout) so the panel
-    drives the real auth flow; ``control`` stays a NAME-only stub until Phase 9.
-    Arguments (email/password/code) pass straight through -- nothing is logged
-    here (T-08-08)."""
+    drives the real auth flow; ``control`` is the REAL control handler (Plan
+    09-02) publishing pause/resume/stop to the captured active client+serial via
+    :func:`make_control_handler`. Arguments (email/password/code/command) pass
+    straight through -- nothing sensitive is logged here (T-08-08 / T-09-07).
+
+    ``start_mqtt`` carries the live client + active serial captured when the
+    session started; it is the source the control handler reads. It is optional
+    so a bare ``make_bridge_handlers(flyout, session)`` still yields a control
+    handler that is a safe no-op until a session exists."""
     handlers = {
         "hide": flyout.hide,
         "login_submit": session.login_submit,
@@ -501,6 +558,7 @@ def make_bridge_handlers(flyout, session):
         "resend_code": session.resend_code,
         "select_printer": session.select_printer,
         "logout": session.logout,
+        "control": make_control_handler(start_mqtt),
     }
     for name in _STUB_ACTIONS:
         handlers[name] = _make_stub_action(name)
@@ -664,6 +722,10 @@ def make_start_mqtt(
         if start_mqtt.started:
             return  # idempotent: at most one network thread (T-08-09)
         start_mqtt.started = True
+        # Capture the ACTIVE serial (the user's OWN selected device) so the
+        # control handler can target it (Plan 09-02, T-09-06). Stored alongside
+        # start_mqtt.client below; the serial is benign and not a secret.
+        start_mqtt.serial = serial
         # ``controller`` is read off the attribute so build_gui can late-bind it
         # after the TrayController is constructed (avoids a construction cycle).
         client, network_runner = _wire_client(
@@ -689,6 +751,9 @@ def make_start_mqtt(
 
     start_mqtt.started = False
     start_mqtt.client = None
+    # The ACTIVE serial captured when a session starts (Plan 09-02): the control
+    # handler reads it to target the user's OWN device. None until start_mqtt runs.
+    start_mqtt.serial = None
     start_mqtt.controller = controller  # late-bindable (build_gui sets it later)
     # Late-bindable panel wiring (Plan 09-01): the on_message wrapper pushes the
     # serialized state to this flyout on each report. build_gui passes the flyout
@@ -825,7 +890,7 @@ def build_gui(
     )
 
     api = bridge.Api(
-        handlers=make_bridge_handlers(flyout, session),
+        handlers=make_bridge_handlers(flyout, session, start_mqtt=start_mqtt),
         state_provider=_state_provider,
     )
     flyout._api = api  # the js_api the window is created with (create() reads it)
@@ -1008,6 +1073,7 @@ def build_app(
     # so the menu/401 disconnect targets it and start_mqtt won't build a second.
     relogin_handler.bind_client(client)
     gui["start_mqtt"].client = client
+    gui["start_mqtt"].serial = serial  # capture active serial for control (09-02)
     gui["start_mqtt"].started = True  # eager path owns the session already
 
     return {

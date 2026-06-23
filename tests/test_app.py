@@ -1086,21 +1086,25 @@ def test_get_initial_state_contains_no_secret(monkeypatch):
     assert "user@example.com" not in blob
 
 
-def test_stub_action_logs_only_name_not_payload(monkeypatch, caplog):
-    """The remaining stub action ('control') logs ONLY the action name, never the
-    command payload (T-07-02). The five auth/select actions are now real
-    SessionController methods (not stubs) and are covered by the session tests."""
+def test_control_action_never_logs_the_command_payload(monkeypatch, caplog):
+    """The real control handler (Plan 09-02) never logs the command value from the
+    app logger (T-09-07). publish_command is patched out so no broker is touched;
+    the app-side handler must keep the command string out of its own logs."""
     import logging
 
     _patch_build_app(monkeypatch)
+    # Patch the publisher so no real client.publish runs; the point of THIS test is
+    # the app handler's logging, not control.py (covered separately).
+    monkeypatch.setattr(app.control, "publish_command", lambda *a, **k: None)
     result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
     api = result["api"]
 
     with caplog.at_level(logging.DEBUG, logger="app"):
         api.control("pause")
 
-    assert "control" in caplog.text  # the action NAME is logged
-    assert "pause" not in caplog.text  # ...but never the command value
+    # The app-side handler must NEVER write the command value into its logs.
+    app_records = [r.message for r in caplog.records if r.name == "app"]
+    assert all("pause" not in m for m in app_records)
 
 
 def test_login_submit_handler_forwards_to_session(monkeypatch):
