@@ -507,19 +507,59 @@ def make_bridge_handlers(flyout, session):
     return handlers
 
 
-def make_flyout_toggle(flyout):
+def make_flyout_toggle(
+    flyout,
+    *,
+    state=None,
+    connection_provider=None,
+    logged_in=False,
+    printer_name="",
+):
     """Build the zero-arg tray LEFT-click toggle.
 
     On the SHOW path it pushes the current Windows theme via
     ``flyout.push_theme(detect_windows_theme())`` so the panel always opens themed
-    to the live light/dark setting (FLY-02), THEN toggles visibility. Hiding does
-    not need a theme push. ``flyout.visible`` distinguishes the two paths."""
+    to the live light/dark setting (FLY-02), THEN (Plan 09-01 Task 2) re-pushes
+    the CURRENT serialized state via ``flyout.push_state`` so a freshly opened
+    panel is immediately correct rather than showing stale page defaults, THEN
+    toggles visibility. Hiding pushes neither theme nor state. ``flyout.visible``
+    distinguishes the two paths.
+
+    ``state`` is the SHARED :class:`~src.state.PrintState` (optional: when None
+    the SHOW path keeps the v1 theme-only behavior). ``connection_provider`` is an
+    optional zero-arg callable yielding the current
+    :class:`~src.status.ConnectionStatus` to serialize with (defaults to
+    DISCONNECTED -- the panel's logged-in/content gating is driven by
+    ``logged_in``). ``logged_in`` / ``printer_name`` are passed through to the
+    serialized dict; ``logged_in`` may be a bool OR a zero-arg callable so the
+    toggle reflects the LIVE session state at click time, not at build time.
+
+    SECURITY: the pushed dict is :func:`bridge.serialize_state` output, which is
+    secret-free by construction (T-09-01)."""
 
     def _toggle():
         # If the window is currently hidden we are about to SHOW it -> push theme
-        # first so the panel renders in the right theme as it appears (FLY-02).
+        # first so the panel renders in the right theme as it appears (FLY-02),
+        # then push the current state so the panel opens current (not stale).
         if not getattr(flyout, "visible", False):
-            flyout.push_theme(render.detect_windows_theme())
+            theme = render.detect_windows_theme()
+            flyout.push_theme(theme)
+            if state is not None:
+                connection = (
+                    connection_provider()
+                    if connection_provider is not None
+                    else ConnectionStatus.DISCONNECTED
+                )
+                is_logged_in = logged_in() if callable(logged_in) else logged_in
+                flyout.push_state(
+                    bridge.serialize_state(
+                        state,
+                        connection,
+                        logged_in=bool(is_logged_in),
+                        printer_name=printer_name,
+                        theme=theme,
+                    )
+                )
         flyout.toggle()
 
     return _toggle
@@ -790,7 +830,24 @@ def build_gui(
     )
     flyout._api = api  # the js_api the window is created with (create() reads it)
     flyout.create()  # create the single hidden window (no-op start; just builds it)
-    flyout_toggle = make_flyout_toggle(flyout)
+    # Plan 09-01 Task 2: the SHOW path re-pushes the CURRENT serialized state so a
+    # freshly opened panel is immediately correct. ``state`` is the shared
+    # PrintState; the connection is read live off the late-bound controller; the
+    # panel is "logged in" once an MQTT session has started (start_mqtt.started).
+    def _toggle_connection():
+        ctrl = _holder["controller"]
+        return (
+            getattr(ctrl, "_status", ConnectionStatus.DISCONNECTED)
+            if ctrl is not None
+            else ConnectionStatus.DISCONNECTED
+        )
+
+    flyout_toggle = make_flyout_toggle(
+        flyout,
+        state=state,
+        connection_provider=_toggle_connection,
+        logged_in=lambda: bool(getattr(start_mqtt, "started", False)),
+    )
 
     # The relogin MENU item now drives the PANEL login (no console prompt): it
     # clears the token + resets the panel to the login screen and shows it.

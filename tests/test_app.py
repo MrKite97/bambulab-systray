@@ -988,6 +988,53 @@ def test_flyout_toggle_pushes_theme_on_show_only(monkeypatch):
     assert flyout.events == ["toggle"]
 
 
+def test_flyout_toggle_pushes_current_state_on_show(monkeypatch):
+    """On the SHOW path make_flyout_toggle re-pushes the CURRENT serialized state
+    (so a freshly opened panel is immediately correct, not stale defaults): it
+    pushes the theme FIRST, then the state, then toggles. Hiding pushes neither
+    theme nor state (Plan 09-01 Task 2)."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    flyout = RecordingPushFlyout(visible=False)
+    state = PrintState()
+    state.mc_percent = 73
+    state.gcode_state = "RUNNING"
+    state.mc_remaining_time = 5
+
+    toggle = app.make_flyout_toggle(flyout, state=state, logged_in=True)
+
+    toggle()  # hidden -> SHOW: push theme, push state, toggle
+    assert flyout.themes == ["dark"]
+    assert len(flyout.pushes) == 1
+    pushed = flyout.pushes[0]
+    assert pushed["pct"] == 73
+    assert pushed["status"] == "printing"
+    assert pushed["etaLabel"] == "nog 5 min"
+    # Ordering: theme pushed BEFORE state, both BEFORE the toggle.
+    assert flyout.events.index(("push_theme", "dark")) < flyout.events.index("toggle")
+
+    # Now visible -> HIDE: no theme push, no state push.
+    flyout.events.clear()
+    flyout.themes.clear()
+    flyout.pushes.clear()
+    toggle()
+    assert flyout.events == ["toggle"]
+    assert flyout.themes == []
+    assert flyout.pushes == []
+
+
+def test_flyout_toggle_without_state_pushes_theme_only(monkeypatch):
+    """Backward-compatible: with no state wired the SHOW path still pushes the
+    theme and toggles, and never attempts a state push (v1 behavior preserved)."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "light")
+    flyout = RecordingPushFlyout(visible=False)
+    toggle = app.make_flyout_toggle(flyout)  # no state
+
+    toggle()
+    assert flyout.themes == ["light"]
+    assert flyout.pushes == []
+    assert "toggle" in flyout.events
+
+
 def test_build_app_wires_flyout_bridge_and_toggle(monkeypatch):
     """build_app exposes a flyout + Api + bound toggle; the Api's hide handler
     calls flyout.hide and the toggle calls flyout.toggle (all via the FakeWebview
