@@ -236,3 +236,42 @@ def test_mqtt_username_from_token_reads_segment_one_not_header_or_sig():
     bogus = base64.b64encode(json.dumps({"username": "u_WRONG"}).encode()).decode()
     token = f"{bogus}.{middle}.{bogus}"
     assert auth.mqtt_username_from_token(token) == "u_999"
+
+
+# --------------------------------------------------------------------------- #
+# Opaque (non-JWT) access token -> REST uid fallback (Bambu format change,
+# verified live 2026-06-23: accessToken is now a 144-char dot-less token).
+# --------------------------------------------------------------------------- #
+
+
+def test_mqtt_username_from_opaque_token_falls_back_to_uid(monkeypatch):
+    """An opaque (no-dot) token derives u_<uid> via the profile REST lookup."""
+    resp = FakeResponse({"uid": 3108780913, "name": "PRINTINATOR"})
+    recorder = RequestRecorder(resp)
+    monkeypatch.setattr(auth.requests, "get", recorder)
+
+    token = "AQBPmfQLopaquetokenwithoutanydots"  # no '.' -> not a JWT
+    assert auth.mqtt_username_from_token(token) == "u_3108780913"
+    assert recorder.last["url"] == auth.PROFILE_URL
+    assert recorder.last["headers"]["Authorization"] == f"Bearer {token}"
+    assert recorder.last["timeout"] == 30
+    assert resp.raise_called is True
+
+
+def test_mqtt_username_jwt_path_never_calls_rest(monkeypatch):
+    """A valid JWT is read locally -- no profile REST call is made."""
+
+    def _boom(*a, **k):  # pragma: no cover - must not be invoked
+        raise AssertionError("REST profile lookup must not run for a JWT token")
+
+    monkeypatch.setattr(auth.requests, "get", _boom)
+    token = _fake_jwt({"username": "u_1234567890"})
+    assert auth.mqtt_username_from_token(token) == "u_1234567890"
+
+
+def test_mqtt_username_jwt_without_username_claim_falls_back(monkeypatch):
+    """A JWT lacking a username claim still falls back to the uid lookup."""
+    resp = FakeResponse({"uid": 42})
+    monkeypatch.setattr(auth.requests, "get", RequestRecorder(resp))
+    token = _fake_jwt({"sub": "no-username-here"})
+    assert auth.mqtt_username_from_token(token) == "u_42"

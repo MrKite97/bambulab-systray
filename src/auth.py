@@ -30,6 +30,11 @@ import requests
 LOGIN_URL = "https://api.bambulab.com/v1/user-service/user/login"
 EMAIL_CODE_URL = "https://api.bambulab.com/v1/user-service/user/sendemail/code"
 BIND_URL = "https://api.bambulab.com/v1/iot-service/api/user/bind"
+# Account profile: returns the numeric ``uid`` used to build the MQTT username
+# when the access token is an opaque (non-JWT) token. Verified live 2026-06-23:
+# Bambu now returns a 144-char opaque accessToken (no JWT segments), so the old
+# JWT ``username``-claim path no longer works on its own.
+PROFILE_URL = "https://api.bambulab.com/v1/design-user-service/my/preference"
 
 # Headers pybambu sends (mimics OrcaSlicer). Content-Type/accept are essential.
 HEADERS = {
@@ -121,20 +126,55 @@ def enrich_devices(devices: list[dict]) -> list[dict]:
     ]
 
 
-def mqtt_username_from_token(access_token: str) -> str:
-    """Derive the MQTT username from the access-token JWT (RESEARCH Pattern 3).
+def _username_from_jwt(access_token: str) -> str | None:
+    """Return the ``u_<digits>`` MQTT username from a JWT access token, or None.
 
     A JWT is ``header.payload.signature``; the payload's ``username`` claim is
-    the MQTT username, formatted ``u_<digits>``. We base64-decode segment[1]
-    only -- the header and signature are ignored, and the signature is NOT
-    verified (we only read a claim; the server enforces token validity, threat
-    T-01-06). stdlib ``base64`` + ``json`` only -- no PyJWT.
+    the MQTT username. We base64-decode segment[1] only -- the header and
+    signature are ignored, and the signature is NOT verified (we only read a
+    claim; the server enforces token validity, threat T-01-06). stdlib
+    ``base64`` + ``json`` only -- no PyJWT.
 
     The base64 payload may lack ``=`` padding, so we re-pad to a multiple of 4
-    before decoding. The MQTT *password* is the raw ``access_token`` itself
-    (handled by the caller; never logged -- threat T-01-04).
+    before decoding. Returns None when the token is NOT a JWT (no second
+    segment / undecodable / no ``username`` claim) so the caller can fall back
+    to the REST uid lookup.
     """
-    payload_b64 = access_token.split(".")[1]
-    payload_b64 += "=" * (-len(payload_b64) % 4)  # fix base64 padding
-    payload = json.loads(base64.b64decode(payload_b64))
-    return payload["username"]  # e.g. "u_1234567890"
+    parts = access_token.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)  # fix base64 padding
+        payload = json.loads(base64.b64decode(payload_b64))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    username = payload.get("username") if isinstance(payload, dict) else None
+    return username or None
+
+
+def uid_from_profile(access_token: str) -> str:
+    """Fetch the account ``uid`` via REST and format the MQTT username.
+
+    Used when the access token is opaque (non-JWT) and the ``username`` claim is
+    therefore unavailable. Bearer auth; the token is never logged. The MQTT
+    username format is ``u_<uid>`` -- the same shape the JWT claim produced.
+    """
+    headers = {**HEADERS, "Authorization": f"Bearer {access_token}"}
+    r = requests.get(PROFILE_URL, headers=headers, timeout=_TIMEOUT)
+    r.raise_for_status()
+    uid = r.json()["uid"]
+    return f"u_{uid}"
+
+
+def mqtt_username_from_token(access_token: str) -> str:
+    """Derive the MQTT username from the access token (RESEARCH Pattern 3).
+
+    Two token shapes are supported. A JWT access token carries a ``username``
+    claim (``u_<digits>``) read directly from its payload. Bambu also issues
+    opaque (non-JWT) access tokens that have no claims; for those we fall back
+    to a REST lookup of the account ``uid`` and build ``u_<uid>`` ourselves.
+    Either way the MQTT *password* is the raw ``access_token`` (handled by the
+    caller; never logged -- threat T-01-04).
+    """
+    return _username_from_jwt(access_token) or uid_from_profile(access_token)
