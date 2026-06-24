@@ -463,9 +463,12 @@ def test_select_printer_persists_serial_region_preserved_and_starts_mqtt():
     c.select_printer("DEV123")
     assert settings.saved[-1] == {"region": "eu", "serial": "DEV123"}
     assert c._test_start_calls == [("tok", "DEV123")]
-    # progress state pushed, logged in
+    # progress state pushed, logged in, with the REAL printer name (not "Printer")
     states = fly.payloads("push_state")
     assert states and states[-1]["loggedIn"] is True
+    assert states[-1]["printerName"] == "X1"
+    # the live name is recorded on the start_mqtt hook so report pushes carry it
+    assert c.start_mqtt.printer_name == "X1"
 
 
 def test_select_printer_without_token_returns_to_login_no_mqtt():
@@ -476,7 +479,7 @@ def test_select_printer_without_token_returns_to_login_no_mqtt():
 
 
 def test_bootstrap_from_stored_valid_token_starts_mqtt():
-    auth = FakeAuth(login_result={}, devices=[{"dev_id": "D1", "online": True}])
+    auth = FakeAuth(login_result={}, devices=[{"dev_id": "D1", "name": "Bench", "online": True}])
     ts = FakeTokenStore(token="stored-tok")
     settings = FakeSettings({"region": "global", "serial": "D1"})
     c, auth, ts, st, fly = _make_controller(auth=auth, token_store=ts, settings=settings)
@@ -485,6 +488,9 @@ def test_bootstrap_from_stored_valid_token_starts_mqtt():
     assert c._test_start_calls == [("stored-tok", "D1")]
     states = fly.payloads("push_state")
     assert states and states[-1]["loggedIn"] is True
+    # the stored serial's real name is resolved and threaded into the live session
+    assert states[-1]["printerName"] == "Bench"
+    assert c.start_mqtt.printer_name == "Bench"
 
 
 def test_bootstrap_from_stored_401_returns_to_login():

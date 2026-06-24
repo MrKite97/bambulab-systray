@@ -224,3 +224,23 @@ def test_combined_merge_all_fields_coexist():
     assert s.nozzle_target_temper == 220.0
     assert s.bed_temper == 60.0
     assert s.bed_target_temper == 65.0
+
+
+def test_reset_restores_all_defaults_in_place():
+    """reset() returns every field to its default and mutates the SAME object
+    (used on logout to clear the retained state)."""
+    s = PrintState()
+    s.merge({
+        "gcode_state": "RUNNING", "mc_percent": 42, "mc_remaining_time": 90,
+        "layer_num": 10, "total_layer_num": 100, "subtask_name": "x.3mf",
+        "nozzle_temper": 210.0, "bed_temper": 60.0,
+    })
+    same = s
+    s.reset()
+    assert s is same  # in place
+    assert s.gcode_state == "unknown"
+    assert s.mc_percent == 0
+    assert s.mc_remaining_time == 0
+    assert s.layer_num == 0 and s.total_layer_num == 0
+    assert s.subtask_name == "" and s.gcode_file == ""
+    assert s.nozzle_temper == 0.0 and s.bed_temper == 0.0

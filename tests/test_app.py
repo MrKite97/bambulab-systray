@@ -1671,3 +1671,5 @@ def test_stop_session_ends_session_without_global_shutdown(monkeypatch):
     # A later login may start a fresh session, and the GLOBAL shutdown is untouched.
     assert start_mqtt.started is False
     assert not gui["shutdown_event"].is_set()
+    # The tray was reset to the neutral logged-out display (no stale print).
+    assert gui["controller"]._status is app.ConnectionStatus.DISCONNECTED

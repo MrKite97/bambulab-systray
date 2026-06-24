@@ -95,6 +95,18 @@ class TrayController:
             return (display, render.icon_text(self._state), self._state.mc_percent)
         return (display, None, None)
 
+    def reset_to_logged_out(self):
+        """Drop the tray back to the neutral logged-out glyph (logout).
+
+        Clears the retained PrintState so it no longer describes the last print,
+        then routes a DISCONNECTED status through the SAME marshalled
+        ``set_connection_status`` seam (enqueue only, never an off-thread icon
+        write). The derived display becomes CLOUD_DISCONNECTED -- the neutral grey
+        frame the app also shows at startup -- instead of a stale ACTIVE_PRINT.
+        Safe to call from the bridge/worker thread (logout runs there)."""
+        self._state.reset()
+        self.set_connection_status(status.ConnectionStatus.DISCONNECTED)
+
     def set_connection_status(self, status_value):
         """Call from the NETWORK thread. Updates the stored connection/token
         status and ENQUEUES a render request via the same queue as

@@ -53,6 +53,16 @@ class PrintState:
     bed_target_temper: float = 0.0  # target bed temperature, degrees C
     last_update_monotonic: float = 0.0
 
+    def reset(self) -> None:
+        """Reset every field back to its default (a fresh, empty print).
+
+        Used on logout so the retained state stops describing the last print and
+        the tray can drop back to its neutral glyph. Mutates IN PLACE so any other
+        holder of this object (e.g. the network thread's userdata) keeps a valid
+        reference rather than pointing at a stale copy.
+        """
+        self.__dict__.update(PrintState().__dict__)
+
     def merge(self, print_obj: dict) -> None:
         """Merge a partial report ``print`` object over the retained state.
 

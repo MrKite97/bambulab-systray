@@ -440,3 +440,27 @@ def test_make_open_item_callback_invokes_toggle_once():
     item(object())
 
     assert calls == [True]
+
+
+# --- reset_to_logged_out (logout drops the tray to the neutral glyph) -------
+
+
+def test_reset_to_logged_out_clears_state_and_shows_neutral():
+    """On logout the tray must stop showing the last print. reset_to_logged_out
+    clears the retained PrintState and routes DISCONNECTED through the marshalled
+    seam, so after a pump the display is the neutral CLOUD_DISCONNECTED glyph
+    (its 'Verbinden…' tooltip) instead of a stale ACTIVE_PRINT."""
+    icon = FakeIcon()
+    state = _active(37, 92)
+    ctrl = _connected(icon, state)
+    ctrl.reassert()  # first paint: ACTIVE_PRINT
+    assert icon.title == "37% — nog 1u 32m"
+
+    ctrl.reset_to_logged_out()
+    # state cleared back to defaults (no longer an active print)
+    assert state.gcode_state == "unknown"
+    assert state.mc_percent == 0
+    assert ctrl._status is ConnectionStatus.DISCONNECTED
+    # reset enqueues a repaint; the UI pump applies it on its thread
+    ctrl.pump_once()
+    assert icon.title == status.TOOLTIP_CLOUD_DISCONNECTED

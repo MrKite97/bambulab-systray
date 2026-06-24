@@ -624,12 +624,13 @@ def make_flyout_toggle(
                     if connection_provider is not None
                     else ConnectionStatus.DISCONNECTED
                 )
+                pname = printer_name() if callable(printer_name) else printer_name
                 flyout.push_state(
                     bridge.serialize_state(
                         state,
                         connection,
                         logged_in=True,
-                        printer_name=printer_name,
+                        printer_name=pname or "",
                         theme=theme,
                     )
                 )
@@ -829,6 +830,14 @@ def make_stop_session(shutdown_event, start_mqtt):
         # Allow a later login to start a fresh session (the old thread has ended).
         start_mqtt.started = False
         start_mqtt.client = None
+        # Drop the tray back to the neutral logged-out glyph so it stops showing
+        # the last print (enqueue-only; safe from this worker thread).
+        controller = getattr(start_mqtt, "controller", None)
+        if controller is not None and hasattr(controller, "reset_to_logged_out"):
+            try:
+                controller.reset_to_logged_out()
+            except Exception:  # noqa: BLE001 - tray reset must never break logout
+                logger.debug("tray reset_to_logged_out raised during stop_session; ignoring")
 
     return stop_session
 
@@ -962,6 +971,9 @@ def build_gui(
         state=state,
         connection_provider=_toggle_connection,
         logged_in=lambda: bool(getattr(start_mqtt, "started", False)),
+        # LIVE printer name (set on the hook by select/bootstrap) so a reopened
+        # progress panel shows the real name, not the generic "Printer".
+        printer_name=lambda: getattr(start_mqtt, "printer_name", "") or "",
     )
 
     # The relogin MENU item now drives the PANEL login (no console prompt): it
@@ -1029,10 +1041,13 @@ def make_panel_relogin(session, flyout, relogin_handler):
     ``input()``/``getpass``/``spike.get_access_token`` (T-08-06/T-08-07)."""
 
     def _relogin(icon=None, item=None):
+        # logout's stop_session resets the tray to DISCONNECTED; set TOKEN_EXPIRED
+        # AFTER it so THIS explicit re-login entry point shows "Opnieuw inloggen
+        # vereist" rather than "Verbinden…" (the pump coalesces to the latest).
+        session.logout()  # clear_token + stop_session + logged-out push
         controller = getattr(relogin_handler, "_controller", None)
         if controller is not None:
             controller.set_connection_status(ConnectionStatus.TOKEN_EXPIRED)
-        session.logout()  # clear_token + stop_session + push_auth_step("login")
         flyout.push_auth_step("login")
         flyout.show()
 

@@ -221,9 +221,14 @@ class SessionController:
             return
 
         def work():
+            name = self._printer_name_for(device_id)
             try:
                 current = self.settings.load_settings()
                 self.settings.save_settings({**current, "serial": device_id})
+                # Set the live printer name BEFORE start_mqtt so the ongoing
+                # report pushes (on_message) carry it -- otherwise the progress
+                # header reverts to the generic "Printer" on the next report.
+                self._set_active_printer_name(name)
                 self.start_mqtt(self._token, device_id)
             except Exception:  # noqa: BLE001
                 logger.warning("Starting the session failed.")
@@ -235,7 +240,7 @@ class SessionController:
                     ConnectionStatus.DISCONNECTED,
                     logged_in=True,
                     auth_step="select",
-                    printer_name=self._printer_name_for(device_id),
+                    printer_name=name,
                 )
             )
 
@@ -292,7 +297,7 @@ class SessionController:
 
         def work():
             try:
-                self.auth.get_device_list(token)
+                devices = self.auth.get_device_list(token)
             except Exception as exc:  # noqa: BLE001
                 if _is_unauthorized(exc):
                     self.token_store.clear_token()
@@ -302,6 +307,11 @@ class SessionController:
                 self.flyout.push_error(_ERR_CONNECT)
                 return
             self._token = token
+            # Resolve the stored serial's display name so the tray + progress
+            # header show the real printer name, not the generic "Printer".
+            self._devices = self._device_rows(self.auth.enrich_devices(devices))
+            name = self._printer_name_for(serial)
+            self._set_active_printer_name(name)
             self.start_mqtt(token, serial)
             self.flyout.push_state(
                 serialize_state(
@@ -309,6 +319,7 @@ class SessionController:
                     ConnectionStatus.DISCONNECTED,
                     logged_in=True,
                     auth_step="select",
+                    printer_name=name,
                 )
             )
 
@@ -370,3 +381,13 @@ class SessionController:
             if row.get("id") == device_id:
                 return row.get("name") or ""
         return ""
+
+    def _set_active_printer_name(self, name):
+        """Record the active printer's display name on the start_mqtt hook so the
+        live report pushes (on_message) and the tray-toggle re-push render the
+        real name instead of the generic "Printer". Best-effort: the hook is a
+        plain attribute holder; never raise into the auth flow."""
+        try:
+            self.start_mqtt.printer_name = name or ""
+        except Exception:  # noqa: BLE001 - cosmetic; must not break login/select
+            pass
