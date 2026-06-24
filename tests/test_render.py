@@ -360,29 +360,28 @@ def test_detect_windows_theme_returns_valid_value():
 
 # --- render_printer_icon ---------------------------------------------------
 
-# Build-area geometry (mirrors render.py constants; sampled in tests).
-_BUILD_LEFT, _BUILD_RIGHT = 14, 50
-_BUILD_TOP, _PLATE_Y = 18, 50
-_FRAME_STROKE = 4
-_BUILD_CENTER_X = (_BUILD_LEFT + _BUILD_RIGHT) // 2
+# Geometry sampled in tests, mirroring the design coords scaled to 64px
+# (render._PSCALE = 64/24). The build column centre is design x12 -> 32; the
+# print head sits over that column near the top, so a pixel there is a FRAME
+# pixel; the plate top is design y18 -> 48.
+from src.render import _MATERIAL_FILL  # noqa: E402 - test-only geometry mirror
+
+_PSCALE = ICON_SIZE / 24.0
+_BUILD_CENTER_X = round(12 * _PSCALE)   # 32 (centre of the build column)
+_BUILD_TOP = round(6.8 * _PSCALE)       # ~18: lands in the print head (a frame pixel)
+_PLATE_TOP = round(18 * _PSCALE)        # 48: build-area bottom / plate top
 
 
 def _fill_column_height(img, x, theme="dark"):
-    """Count neutral-grey FILL pixels strictly inside the build area at column x.
+    """Count translucent MATERIAL-fill pixels in the build column at x.
 
-    Only pixels equal to the neutral fill color are counted, so frame-stroke
-    pixels that happen to cross this column are excluded -- this measures the
-    material fill height, not the frame.
+    Only pixels equal to the material fill color are counted, so the
+    (opaque) frame / print-head pixels crossing this column are excluded --
+    this measures the printed-object fill height, not the frame.
     """
     px = img.load()
-    fill = status_to_color("neutral", theme)
-    # Sample strictly between the top frame stroke and the plate stroke so a
-    # grey frame (neutral status) is not mistaken for fill.
-    return sum(
-        1
-        for y in range(_BUILD_TOP + _FRAME_STROKE, _PLATE_Y - _FRAME_STROKE)
-        if px[x, y] == fill
-    )
+    fill = _MATERIAL_FILL[theme]
+    return sum(1 for y in range(_BUILD_TOP, _PLATE_TOP) if px[x, y] == fill)
 
 
 def test_render_printer_icon_is_64x64_rgba():
@@ -402,23 +401,23 @@ def test_render_printer_icon_fill_height_grows_with_pct():
 
 
 def test_render_printer_icon_frame_is_status_color():
-    """A frame pixel equals the mapped status color (printing), not the neutral fill."""
+    """A frame pixel equals the mapped status color (printing), not the fill."""
     img = render_printer_icon(50, "printing", theme="dark")
     px = img.load()
-    # Top frame stroke runs across the build top; sample its center.
+    # The print head sits over the build column near the top; sample it.
     frame_pixel = px[_BUILD_CENTER_X, _BUILD_TOP]
     assert frame_pixel == status_to_color("printing", "dark") == (84, 197, 255, 255)
     assert frame_pixel != status_to_color("neutral", "dark")
 
 
-def test_render_printer_icon_fill_is_neutral_not_status():
-    """The fill column is neutral material grey, never the status color."""
+def test_render_printer_icon_fill_is_material_not_status():
+    """The fill column is translucent MATERIAL grey, never the status color."""
     img = render_printer_icon(80, "printing", theme="dark")
     px = img.load()
-    # Mid-fill, clear of the plate stroke: at pct=80 the fill reaches ~y=24,
-    # so y=40 at the build center is solidly inside the neutral fill.
+    # Mid-fill, below the print head and clear of the plate: at pct=80 the fill
+    # reaches up to ~y=24, so y=40 at the build center is solidly inside it.
     fill_pixel = px[_BUILD_CENTER_X, 40]
-    assert fill_pixel == status_to_color("neutral", "dark") == (154, 160, 170, 255)
+    assert fill_pixel == _MATERIAL_FILL["dark"] == (232, 232, 236, 184)
     assert fill_pixel != status_to_color("printing", "dark")
 
 

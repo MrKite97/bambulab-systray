@@ -989,8 +989,9 @@ def build_gui(
 
     icon = pystray.Icon(
         "bambu-systray",
-        # LOGGED-OUT neutral glyph until login completes (Plan 08-02).
-        icon=render.render_icon(None),
+        # LOGGED-OUT neutral printer glyph until login completes (matches the
+        # painted glyph so there's no brief legacy-dot flash before first paint).
+        icon=render.render_printer_icon(0, "neutral", logged_out=True),
         title=render.tooltip_text(state),  # "Geen actieve print"
         menu=pystray.Menu(
             make_open_item(flyout_toggle),
@@ -1241,10 +1242,10 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     flyout = gui["flyout"]
     session = gui["session"]
 
-    # Start LOGGED-OUT: the tray shows the neutral glyph until a login completes
-    # (bootstrap flips it when a stored session validates). render_icon(None) is
-    # the neutral/logged-out frame.
-    icon.icon = render.render_icon(None)
+    # Start LOGGED-OUT: the tray shows the neutral printer glyph until a login
+    # completes (bootstrap flips it when a stored session validates). This is the
+    # SAME glyph the pump paints, so there's no brief legacy-dot flash.
+    icon.icon = render.render_printer_icon(0, "neutral", logged_out=True)
 
     # Defer the bootstrap + initial show to the window's DOM-loaded event. Both
     # push to the page (push_auth_step / evaluate_js) and SHOW the window, which

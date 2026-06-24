@@ -1275,7 +1275,8 @@ def test_main_logged_out_start_sets_neutral_glyph_and_shows_flyout(monkeypatch):
     session = _BootstrapSession(bootstrap_result=False)
 
     neutral = object()
-    monkeypatch.setattr(app.render, "render_icon", lambda v: neutral)
+    # main() paints the neutral logged-out PRINTER glyph at startup.
+    monkeypatch.setattr(app.render, "render_printer_icon", lambda *a, **k: neutral)
     monkeypatch.setattr(
         app.settings_module, "load_settings", lambda: {"region": "global", "serial": None}
     )

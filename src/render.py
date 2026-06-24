@@ -195,13 +195,31 @@ def detect_windows_theme() -> str:
         return "dark"
 
 
-# Printer-frame geometry on the 64x64 canvas. The build area is the inner region
-# the printed object fills; the fill runs flush to the plate (no bottom gap).
-_BUILD_LEFT = 14
-_BUILD_RIGHT = 50
-_BUILD_TOP = 18
-_PLATE_Y = 50
-_FRAME_STROKE = 4
+# --- Printer tray glyph, recreated 1:1 from the design handoff -----------------
+# Source: design_handoff_printer_tray/3D-printer voortgang.dc.html, the default
+# "printer" tray SVG. The design draws in a 0..24 viewBox; we scale every
+# coordinate to the 64px canvas (_PSCALE) and let Windows downscale to the tray
+# size. The shape is a real printer: a top GANTRY bar, two side POSTS, a PRINT
+# HEAD hanging from the gantry, and a BUILD PLATE -- all in the status color. The
+# build area between them fills bottom-to-top with translucent MATERIAL grey
+# (never the status color) by progress, so the colored contour stays legible even
+# at a 1% sliver. Logged out / neutral: grey frame, no fill.
+_PSCALE = ICON_SIZE / 24.0  # design viewBox is 24 units wide/tall
+
+# Build area the printed object fills (design clipPath rect x6 y6.5 w12 h11.5).
+# The bottom equals the build-plate top, so the fill runs flush to the plate.
+_PRN_BUILD_X = 6.0
+_PRN_BUILD_W = 12.0
+_PRN_BUILD_TOP = 6.5
+_PRN_BUILD_BOTTOM = 18.0
+_PRN_BUILD_H = _PRN_BUILD_BOTTOM - _PRN_BUILD_TOP  # 11.5
+
+# Translucent printed-material grey (design ``printFill``): light-on-dark /
+# dark-on-light, kept DISTINCT from the neutral FRAME grey so the contour wins.
+_MATERIAL_FILL = {
+    "dark": (232, 232, 236, 184),   # rgba(232,232,236,.72)
+    "light": (58, 58, 66, 140),     # rgba(58,58,66,.55)
+}
 
 
 def render_printer_icon(
@@ -211,49 +229,55 @@ def render_printer_icon(
     theme: str | None = None,
     logged_out: bool = False,
 ) -> Image.Image:
-    """Render the printer-fill tray glyph as a 64x64 RGBA image.
+    """Render the printer tray glyph (design "printer" style) as 64x64 RGBA.
 
-    The printer frame (body outline + build plate) is drawn in
-    ``status_to_color(status, theme)``. The build area fills bottom-to-top with
-    NEUTRAL material grey (never the status color) to a height of
-    ``pct/100 x build-area height``, clipped to the build area and flush to the
-    plate. ``pct`` is clamped to 0..100. The fill is drawn ONLY when there is an
-    active status (not ``logged_out`` and ``status != "neutral"``) and the fill
-    height is non-zero; logged-out / neutral renders a grey frame with no fill.
+    The printer FRAME (gantry bar + two posts + print head + build plate) is
+    drawn in ``status_to_color(status, theme)`` -- or neutral grey when
+    ``logged_out``. The build area fills bottom-to-top with translucent MATERIAL
+    grey to ``pct`` of its height, clipped to the build area and flush to the
+    plate. ``pct`` is clamped 0..100. The fill is drawn ONLY for an active status
+    (not ``logged_out`` and ``status != "neutral"``) with non-zero height;
+    logged-out / neutral renders the grey frame with no fill. Recreated 1:1 from
+    the design handoff SVG (scaled from its 24-unit viewBox to 64px).
     """
     theme = theme or detect_windows_theme()
-    frame_color = status_to_color(status, theme)
-    neutral_fill = status_to_color("neutral", theme)
+    if theme not in _MATERIAL_FILL:
+        theme = "dark"
+    frame_color = status_to_color("neutral" if logged_out else status, theme)
+    material = _MATERIAL_FILL[theme]
 
     img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    # Fill the build area FIRST (neutral grey), then stroke the frame on top so
-    # the colored contour always wins where they overlap (keeps pct=1 legible).
-    show_fill = not logged_out and status != "neutral"
-    if show_fill:
-        build_h = _PLATE_Y - _BUILD_TOP
-        fill_h = round(max(0, min(100, pct)) / 100 * build_h)
+    def s(v: float) -> float:
+        """Scale a design (0..24) coordinate to the 64px canvas."""
+        return v * _PSCALE
+
+    # Build-area fill FIRST (so the frame + print head drawn next win on overlap,
+    # keeping the colored contour legible even at high fill).
+    if not logged_out and status != "neutral":
+        p = max(0, min(100, pct)) / 100.0
+        fill_h = _PRN_BUILD_H * p
         if fill_h > 0:
-            fill_top = _PLATE_Y - fill_h
-            d.rectangle(
-                [_BUILD_LEFT, fill_top, _BUILD_RIGHT, _PLATE_Y],
-                fill=neutral_fill,
+            top = max(_PRN_BUILD_TOP, _PRN_BUILD_BOTTOM - fill_h)
+            r = min(1.0, fill_h / 2.0, _PRN_BUILD_W / 2.0)  # clamp so PIL never errors
+            d.rounded_rectangle(
+                [s(_PRN_BUILD_X), s(top),
+                 s(_PRN_BUILD_X + _PRN_BUILD_W), s(_PRN_BUILD_BOTTOM)],
+                radius=s(r), fill=material,
             )
 
-    # Printer body outline (the build-area rectangle) + the build plate line,
-    # both in the frame/status color at full stroke.
-    d.rectangle(
-        [_BUILD_LEFT, _BUILD_TOP, _BUILD_RIGHT, _PLATE_Y],
-        outline=frame_color,
-        width=_FRAME_STROKE,
-    )
-    # Emphasize the build plate (bottom) as a solid base line.
-    d.line(
-        [(_BUILD_LEFT, _PLATE_Y), (_BUILD_RIGHT, _PLATE_Y)],
-        fill=frame_color,
-        width=_FRAME_STROKE,
-    )
+    # Top gantry bar (design rect x4 y3.8 w16 h2 rx1).
+    d.rounded_rectangle([s(4), s(3.8), s(20), s(5.8)], radius=s(1.0), fill=frame_color)
+    # Two side posts (design path "M5 5.5 V18" / "M19 5.5 V18", stroke 1.9 round).
+    _hw = 1.9 / 2.0
+    d.rounded_rectangle([s(5 - _hw), s(5.5), s(5 + _hw), s(18)], radius=s(_hw), fill=frame_color)
+    d.rounded_rectangle([s(19 - _hw), s(5.5), s(19 + _hw), s(18)], radius=s(_hw), fill=frame_color)
+    # Print head hanging from the gantry (design rect x10.4 y5.4 w3.2 h2.6 rx.7).
+    d.rounded_rectangle([s(10.4), s(5.4), s(13.6), s(8.0)], radius=s(0.7), fill=frame_color)
+    # Build plate / base (design rect x3.3 y18 w17.4 h2.4 rx1).
+    d.rounded_rectangle([s(3.3), s(18), s(20.7), s(20.4)], radius=s(1.0), fill=frame_color)
+
     return img
 
 
