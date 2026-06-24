@@ -28,12 +28,17 @@
   @keyframes tbShim  { 0%{transform:translateX(-120%)} 100%{transform:translateX(260%)} }
 
   * { box-sizing:border-box; }
-  html, body { margin:0; padding:0; }
+  /* Fill the whole window with the panel background (the window has no real
+     transparency in WebView2, so a transparent body rendered as a white strip
+     below the card). height:100% + dark bg means no white flash before the
+     content-fit resize lands; overflow:hidden kills the stray scrollbars. */
+  html, body { margin:0; padding:0; height:100%; }
 
   body {
     font-family:'Segoe UI Variable','Segoe UI',system-ui,-apple-system,'Helvetica Neue',sans-serif;
     width:352px;
-    background:transparent;
+    background:var(--flyout-bg);
+    overflow:hidden;
     -webkit-user-select:none;
     user-select:none;
   }
@@ -96,16 +101,17 @@
     --input-border:rgba(0,0,0,.16);
   }
 
-  /* ---- flyout shell ---- */
+  /* ---- flyout shell ----
+     The flyout IS the window content: full width, edge-to-edge, no card border/
+     radius/shadow (those left white corner gaps in a non-transparent window).
+     Windows 11 rounds the top-level window corners itself. Its measured height
+     drives the window resize (see syncHeight) so the panel hugs its content. */
   .flyout {
     width:352px;
     padding:18px;
-    border-radius:10px;
     background:var(--flyout-bg);
-    border:1px solid var(--flyout-border);
     -webkit-backdrop-filter:blur(40px) saturate(150%);
     backdrop-filter:blur(40px) saturate(150%);
-    box-shadow:0 18px 44px -10px rgba(0,0,0,.4), 0 4px 12px rgba(0,0,0,.18);
   }
 
   /* ---- screen visibility (one screen visible at a time) ---- */
@@ -441,6 +447,21 @@
       var el = $(ids[i]);
       if (el) { el.classList.toggle("active", ids[i] === id); }
     }
+    syncHeight();
+  }
+
+  // Resize the window to the rendered content height so the flyout hugs its
+  // content -- no empty strip below the panel, no scrollbars. Measured on the
+  // next frame so the just-applied DOM/screen swap has laid out first. A no-op
+  // when the bridge/resize API isn't ready yet (early page load).
+  function syncHeight() {
+    if (!hasApi() || typeof window.pywebview.api.resize !== "function") { return; }
+    requestAnimationFrame(function () {
+      var el = document.querySelector(".flyout");
+      if (!el) { return; }
+      var h = Math.ceil(el.getBoundingClientRect().height);
+      if (h > 0) { window.pywebview.api.resize(h); }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -473,6 +494,7 @@
       banner.textContent = String(msg);
       banner.classList.add("visible");
     }
+    syncHeight();
   }
 
   function applyDevices(list) {
@@ -521,6 +543,7 @@
 
       container.appendChild(row);
     });
+    syncHeight();
   }
 
   function applyState(state) {
@@ -592,6 +615,8 @@
     primaryBtn.disabled = !primaryActive;
     primaryBtn.style.opacity = primaryActive ? "" : "0.45";
     primaryBtn.style.cursor = primaryActive ? "pointer" : "default";
+
+    syncHeight();
   }
 
   // expose Python -> page entry points
@@ -681,8 +706,17 @@
   });
 
   // click-away hide (CONTEXT LOCKED): losing focus hides the flyout.
+  // A frameless on-top window shown from the tray does not reliably keep focus,
+  // so a spurious focus->blur fires the instant it appears and would hide it
+  // again immediately (flyout "flashes" and vanishes). Python stamps
+  // window.__flyoutShownAt just before each show(); we ignore any blur within a
+  // short grace window of that stamp so only a genuine later click-away hides.
+  var BLUR_GRACE_MS = 800;
   window.addEventListener('blur', function () {
-    if (hasApi()) { window.pywebview.api.hide(); }
+    if (!hasApi()) { return; }
+    var shownAt = window.__flyoutShownAt || 0;
+    if (Date.now() - shownAt < BLUR_GRACE_MS) { return; }
+    window.pywebview.api.hide();
   });
 
   if (document.readyState === "loading") {

@@ -559,6 +559,7 @@ def make_bridge_handlers(flyout, session, *, start_mqtt=None):
         "select_printer": session.select_printer,
         "logout": session.logout,
         "control": make_control_handler(start_mqtt),
+        "resize": flyout.resize_to,
     }
     for name in _STUB_ACTIONS:
         handlers[name] = _make_stub_action(name)

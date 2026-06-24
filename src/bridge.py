@@ -34,6 +34,7 @@ _METHODS = (
     "select_printer",
     "logout",
     "control",
+    "resize",
 )
 
 
@@ -166,6 +167,11 @@ class Api:
         # The pause/resume/stop allowlist is enforced in control.py (Phase 5)
         # and re-checked when wired in Phase 9 (T-07-05).
         return self._call("control", command)
+
+    def resize(self, height):
+        # Pure window-geometry hint from the page: resize the flyout to fit its
+        # rendered content height (no secret, no printer interaction).
+        return self._call("resize", height)
 
     # --- initial pull (Python -> page seed) ------------------------------- #
 

@@ -45,10 +45,14 @@ class FakeWindow:
         self.hidden = 0
         self.evaluated = []
         self.destroyed = 0
+        self.resized = []
         self.events = FakeEvents()
 
     def move(self, x, y):
         self.moved.append((x, y))
+
+    def resize(self, w, h):
+        self.resized.append((w, h))
 
     def show(self):
         self.shown += 1
@@ -129,6 +133,39 @@ def test_show_anchors_bottom_right_exact():
     assert fake.window.moved[-1] == (expected_x, expected_y)
     assert fake.window.shown == 1
     assert fw.visible is True
+
+
+def test_show_arms_blur_grace_stamp():
+    """show() stamps window.__flyoutShownAt so the page's click-away blur handler
+    can ignore the spurious focus->blur that fires the instant a frameless on-top
+    window appears (which would otherwise immediately hide the flyout)."""
+    api, fake, fw = _make()
+    fw.create()
+    fw.show()
+    assert fake.window.shown == 1
+    stamps = [c for c in fake.window.evaluated if "__flyoutShownAt" in c]
+    assert stamps == ["window.__flyoutShownAt = Date.now()"]
+
+
+def test_resize_to_resizes_and_reanchors_bottom_right():
+    """resize_to() resizes to (WIDTH, height) and re-anchors bottom-right using
+    the NEW height so the flyout stays glued above the taskbar as it grows."""
+    api, fake, fw = _make(screen_size=(1920, 1080))
+    fw.create()
+    fw.resize_to(440)
+    assert fake.window.resized[-1] == (FlyoutWindow.WIDTH, 440)
+    expected_x = 1920 - FlyoutWindow.WIDTH - FlyoutWindow.MARGIN
+    expected_y = 1080 - 440 - FlyoutWindow.TASKBAR_HEIGHT - FlyoutWindow.MARGIN
+    assert fake.window.moved[-1] == (expected_x, expected_y)
+
+
+def test_resize_to_ignores_nonpositive_and_nonnumeric():
+    """A non-positive or non-numeric height is ignored (no resize, no raise)."""
+    api, fake, fw = _make()
+    fw.create()
+    for bad in (0, -10, None, "abc"):
+        fw.resize_to(bad)
+    assert fake.window.resized == []
 
 
 def test_hide_sets_invisible():

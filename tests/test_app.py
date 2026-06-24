@@ -924,6 +924,9 @@ class RecordingFlyout:
     def destroy(self):
         self.events.append("destroy")
 
+    def resize_to(self, height):
+        self.events.append(("resize_to", height))
+
     def push_theme(self, theme):
         self.events.append(("push_theme", theme))
 
@@ -1362,6 +1365,7 @@ def test_make_bridge_handlers_wires_session_methods():
     assert handlers["select_printer"].__self__ is session
     assert handlers["logout"].__self__ is session
     assert handlers["hide"].__self__ is flyout  # flyout.hide bound method
+    assert handlers["resize"].__self__ is flyout  # flyout.resize_to bound method
 
     # Forwarding: calling the bridge handler drives the controller method.
     handlers["login_submit"]("me@example.com", "pw")

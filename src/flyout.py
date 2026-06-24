@@ -77,6 +77,10 @@ class FlyoutWindow:
         self._panel_url = panel_url
         self._window = None
         self.visible = False
+        # Current window height; the page drives this via :meth:`resize_to` so the
+        # flyout hugs its content. Drives the bottom-right anchor so the window
+        # stays glued above the taskbar as it grows/shrinks.
+        self._height = self.HEIGHT
 
     # --- window lifecycle ------------------------------------------------- #
 
@@ -121,16 +125,51 @@ class FlyoutWindow:
             return None
         screen_w, screen_h = size
         x = screen_w - self.WIDTH - self.MARGIN
-        y = screen_h - self.HEIGHT - self.TASKBAR_HEIGHT - self.MARGIN
+        y = screen_h - self._height - self.TASKBAR_HEIGHT - self.MARGIN
         return (x, y)
 
+    def resize_to(self, height):
+        """Resize the window to ``height`` px and keep it bottom-right anchored.
+
+        The page calls this (``api.resize``) after each render so the flyout
+        hugs its content -- no empty strip below the panel and no scrollbars.
+        Re-anchoring keeps the bottom edge glued above the taskbar as the height
+        changes (the window grows upward). Non-positive / non-numeric heights are
+        ignored and nothing here raises into the GUI loop (a resize hiccup must
+        never break the panel)."""
+        if self._window is None:
+            return
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return
+        if h <= 0:
+            return
+        self._height = h
+        try:
+            self._window.resize(self.WIDTH, h)
+        except Exception:  # noqa: BLE001 - a resize failure must not break the UI
+            return
+        anchor = self._anchor()
+        if anchor is not None:
+            self._window.move(anchor[0], anchor[1])
+
     def show(self):
-        """Anchor bottom-right (if metrics available) then show the window."""
+        """Anchor bottom-right (if metrics available) then show the window.
+
+        Stamps ``window.__flyoutShownAt`` in the page BEFORE the OS show call so
+        the page's click-away ``blur`` handler can ignore the spurious
+        focus->blur that fires the instant a frameless on-top window appears
+        (otherwise the flyout would hide itself immediately). Stamping before
+        ``show()`` avoids a race with that first blur. ``evaluate_js`` is a
+        no-op before the window/page exists, so this stays safe at startup.
+        """
         if self._window is None:
             return
         anchor = self._anchor()
         if anchor is not None:
             self._window.move(anchor[0], anchor[1])
+        self._evaluate("window.__flyoutShownAt = Date.now()")
         self._window.show()
         self.visible = True
 
