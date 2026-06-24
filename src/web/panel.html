@@ -390,7 +390,8 @@
   var current = {
     loggedIn: false,
     authStep: "login",   // "login" | "code" | "select"
-    status: "idle"       // drives which control command to send
+    status: "idle",      // drives which control command to send
+    screen: "screen-login" // the visible screen id (drives the click-away rule)
   };
 
   // ---- status -> Dutch label + token color for the progress panel ----
@@ -416,6 +417,7 @@
   }
 
   function showScreen(id) {
+    current.screen = id;  // remembered for the click-away (blur) rule below
     var ids = ["screen-progress", "screen-login", "screen-code", "screen-select"];
     for (var i = 0; i < ids.length; i++) {
       var el = $(ids[i]);
@@ -694,6 +696,11 @@
   var BLUR_GRACE_MS = 800;
   window.addEventListener('blur', function () {
     if (!hasApi()) { return; }
+    // Only the glanceable progress panel auto-hides on click-away. The login /
+    // code / select screens MUST stay open so the user can switch to their
+    // browser or mail (e.g. to fetch the 6-digit 2FA code) and come back to the
+    // same screen without it vanishing.
+    if (current.screen !== "screen-progress") { return; }
     var shownAt = window.__flyoutShownAt || 0;
     if (Date.now() - shownAt < BLUR_GRACE_MS) { return; }
     window.pywebview.api.hide();

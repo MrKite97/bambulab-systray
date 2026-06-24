@@ -1036,6 +1036,23 @@ def test_flyout_toggle_pushes_current_state_on_show(monkeypatch):
     assert flyout.pushes == []
 
 
+def test_flyout_toggle_logged_out_show_does_not_push_state(monkeypatch):
+    """When LOGGED OUT, the SHOW path pushes the theme but NOT a serialized state:
+    a logged-out re-push carries auth_step="login" and would clobber whichever
+    auth screen the page is on (e.g. reopening after stepping away to fetch the
+    2FA code must keep the code screen, not snap back to login)."""
+    monkeypatch.setattr(app.render, "detect_windows_theme", lambda: "dark")
+    flyout = RecordingPushFlyout(visible=False)
+    state = PrintState()
+
+    toggle = app.make_flyout_toggle(flyout, state=state, logged_in=False)
+
+    toggle()  # hidden -> SHOW
+    assert flyout.themes == ["dark"]   # theme still pushed
+    assert flyout.pushes == []          # but NO state push -> page keeps its screen
+    assert "toggle" in flyout.events
+
+
 def test_flyout_toggle_without_state_pushes_theme_only(monkeypatch):
     """Backward-compatible: with no state wired the SHOW path still pushes the
     theme and toggles, and never attempts a state push (v1 behavior preserved)."""

@@ -610,18 +610,25 @@ def make_flyout_toggle(
         if not getattr(flyout, "visible", False):
             theme = render.detect_windows_theme()
             flyout.push_theme(theme)
-            if state is not None:
+            is_logged_in = logged_in() if callable(logged_in) else logged_in
+            # Re-push the live state ONLY when logged in, so a freshly opened
+            # progress panel is current (not stale). When LOGGED OUT we must NOT
+            # re-push: serialize_state would carry auth_step="login" and clobber
+            # whichever auth screen the page is on -- e.g. reopening the flyout
+            # after stepping away to fetch the 2FA code would throw the user back
+            # to the login screen and lose the code entry. The page already holds
+            # the correct auth screen, so leave it untouched.
+            if state is not None and is_logged_in:
                 connection = (
                     connection_provider()
                     if connection_provider is not None
                     else ConnectionStatus.DISCONNECTED
                 )
-                is_logged_in = logged_in() if callable(logged_in) else logged_in
                 flyout.push_state(
                     bridge.serialize_state(
                         state,
                         connection,
-                        logged_in=bool(is_logged_in),
+                        logged_in=True,
                         printer_name=printer_name,
                         theme=theme,
                     )
