@@ -1338,6 +1338,9 @@ class FakeSession:
     def select_printer(self, device_id):
         self.calls.append(("select_printer", device_id))
 
+    def open_printer_select(self):
+        self.calls.append(("open_printer_select",))
+
     def logout(self):
         self.calls.append(("logout",))
 
@@ -1363,6 +1366,7 @@ def test_make_bridge_handlers_wires_session_methods():
     assert handlers["submit_code"].__self__ is session
     assert handlers["resend_code"].__self__ is session
     assert handlers["select_printer"].__self__ is session
+    assert handlers["open_printer_select"].__self__ is session
     assert handlers["logout"].__self__ is session
     assert handlers["hide"].__self__ is flyout  # flyout.hide bound method
     assert handlers["resize"].__self__ is flyout  # flyout.resize_to bound method
@@ -1599,6 +1603,28 @@ def test_start_mqtt_hook_starts_network_thread_at_most_once(monkeypatch):
     assert thread_starts.count("mqtt-network") == 1
 
 
+def test_relogin_after_logout_starts_a_fresh_session(monkeypatch):
+    """After stop_session (logout), a later start_mqtt starts a NEW session: a
+    new client, a new (cleared) session_stop, and a second network thread -- so
+    re-login in the same process reconnects (the old idempotent guard is reset)."""
+    gui, thread_starts = _build_gui(monkeypatch)
+    start_mqtt = gui["start_mqtt"]
+    stop_session = gui["stop_session"]
+
+    start_mqtt("T1", "S1")
+    first_client = start_mqtt.client
+    first_stop = start_mqtt.session_stop
+
+    stop_session()  # logout
+    start_mqtt("T2", "S2")  # re-login
+
+    assert start_mqtt.started is True
+    assert start_mqtt.client is not first_client
+    assert start_mqtt.session_stop is not first_stop
+    assert not start_mqtt.session_stop.is_set()
+    assert thread_starts.count("mqtt-network") == 2
+
+
 def test_start_mqtt_not_called_at_build_time(monkeypatch):
     """build_gui NEVER starts the network thread itself -- only the start_mqtt
     hook does, once a token + serial exist (deferred MQTT start)."""
@@ -1606,17 +1632,25 @@ def test_start_mqtt_not_called_at_build_time(monkeypatch):
     assert "mqtt-network" not in thread_starts  # nothing started by construction
 
 
-def test_stop_session_signals_shutdown_and_disconnects(monkeypatch):
-    """stop_session sets the shutdown event and disconnects the live client so
-    logout returns to a clean logged-out state (best-effort, never raising)."""
+def test_stop_session_ends_session_without_global_shutdown(monkeypatch):
+    """stop_session ends ONLY the current MQTT session: it sets the per-session
+    stop event, disconnects the live client, and resets ``started`` so a later
+    login starts fresh -- WITHOUT setting the global shutdown event (which also
+    drives the tray pump / quit), so logout leaves the app usable."""
     gui, _ = _build_gui(monkeypatch)
     start_mqtt = gui["start_mqtt"]
     stop_session = gui["stop_session"]
 
     start_mqtt("TOKEN", "SER")  # build the live client
+    client = start_mqtt.client
+    session_stop = start_mqtt.session_stop
+    assert session_stop is not None and not session_stop.is_set()
+
     stop_session()
 
-    assert gui["shutdown_event"].is_set()
-    # The client built by start_mqtt was disconnected (best-effort).
-    assert start_mqtt.client is not None
-    assert start_mqtt.client.disconnect_count == 1
+    # The session was told to stop and the client was disconnected (best-effort).
+    assert session_stop.is_set()
+    assert client.disconnect_count == 1
+    # A later login may start a fresh session, and the GLOBAL shutdown is untouched.
+    assert start_mqtt.started is False
+    assert not gui["shutdown_event"].is_set()

@@ -290,6 +290,51 @@ def test_logout_clears_token_stops_session_resets_to_login():
     c.logout()
     assert ts.cleared == 1
     assert c._test_stop_calls == [True]
+    # logout pushes a fully logged-OUT state (not a bare auth-step) so the page's
+    # own loggedIn flag is reset and the panel lands on the login screen.
+    state = fly.payloads("push_state")[-1]
+    assert state["loggedIn"] is False
+    assert state["authStep"] == "login"
+
+
+# --------------------------------------------------------------------------- #
+# open_printer_select (gear button)                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_open_printer_select_fetches_and_pushes_devices():
+    """The gear re-fetches the bound devices with the held token and pushes the
+    rows + the select step so the printer list renders while logged in."""
+    auth = FakeAuth(
+        devices=[{"dev_id": "D1", "name": "X1", "dev_model_name": "X1C", "online": True}],
+    )
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c._token = "TOK"  # already logged in
+    c.open_printer_select()
+    assert auth.method_calls("get_device_list") == [("TOK",)]
+    rows = fly.payloads("push_devices")[-1]
+    assert rows[0]["id"] == "D1"
+    assert fly.steps()[-1] == "select"
+
+
+def test_open_printer_select_without_token_goes_to_login():
+    """No held token -> bounce to the login screen, no network call."""
+    c, auth, ts, st, fly = _make_controller()
+    c._token = None
+    c.open_printer_select()
+    assert not auth.called("get_device_list")
+    assert fly.steps()[-1] == "login"
+
+
+def test_open_printer_select_401_clears_token_and_resets_login():
+    """A 401 on the device fetch clears the token and resets to login (no reuse)."""
+    err = RuntimeError("401 Unauthorized")
+    auth = FakeAuth(devices_exc=err)
+    c, auth, ts, st, fly = _make_controller(auth=auth)
+    c._token = "STALE"
+    c.open_printer_select()
+    assert ts.cleared == 1
+    assert c._token is None
     assert fly.steps()[-1] == "login"
 
 

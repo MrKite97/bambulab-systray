@@ -333,33 +333,7 @@
       <input class="field" id="input-password" type="password" placeholder="Wachtwoord" autocomplete="current-password" />
     </div>
 
-    <div style="margin-top:9px; display:flex; justify-content:flex-end;">
-      <span class="link" style="font-size:12px;">Wachtwoord vergeten?</span>
-    </div>
-
-    <button class="btn-primary" id="btn-login" style="margin-top:11px;" type="button">Inloggen</button>
-
-    <div class="divider-row">
-      <div class="divider"></div>
-      <span style="font-size:11px; color:var(--text-secondary);">of ga verder met</span>
-      <div class="divider"></div>
-    </div>
-
-    <div style="margin-top:13px; display:flex; gap:9px;">
-      <button class="btn-outline" style="flex:1;" type="button">
-        <svg width="15" height="15" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.5 12.2c0-.7-.06-1.4-.18-2.06H12v3.9h5.9a5 5 0 0 1-2.18 3.3v2.7h3.52c2.06-1.9 3.26-4.7 3.26-7.84Z"/><path fill="#34A853" d="M12 23c2.94 0 5.4-.97 7.2-2.63l-3.52-2.73c-.97.66-2.23 1.05-3.68 1.05-2.83 0-5.23-1.9-6.09-4.48H2.27v2.82A11 11 0 0 0 12 23Z"/><path fill="#FBBC05" d="M5.91 14.21a6.6 6.6 0 0 1 0-4.21V7.18H2.27a11 11 0 0 0 0 9.85l3.64-2.82Z"/><path fill="#EA4335" d="M12 5.5c1.6 0 3.03.55 4.16 1.62l3.12-3.12A11 11 0 0 0 12 1 11 11 0 0 0 2.27 7.18l3.64 2.82C6.77 7.42 9.17 5.5 12 5.5Z"/></svg>
-        Google
-      </button>
-      <button class="btn-outline" style="flex:1;" type="button">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M16.36 12.78c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.73-1.36-.14-2.65.8-3.34.8-.68 0-1.74-.78-2.86-.76-1.47.02-2.83.85-3.58 2.16-1.53 2.65-.39 6.57 1.1 8.72.73 1.05 1.6 2.23 2.74 2.19 1.1-.05 1.51-.71 2.84-.71 1.32 0 1.7.71 2.86.69 1.18-.02 1.93-1.07 2.65-2.13.84-1.22 1.18-2.4 1.2-2.46-.03-.01-2.29-.88-2.31-3.48ZM14.2 6.1c.6-.74 1.01-1.76.9-2.78-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.69-.92 2.68.97.08 1.97-.49 2.58-1.21Z"/></svg>
-        Apple
-      </button>
-    </div>
-
-    <div style="margin-top:15px; display:flex; align-items:center; justify-content:center; gap:6px;">
-      <span style="font-size:12px; color:var(--text-secondary);">Nog geen account?</span>
-      <span class="link" style="font-size:12px; font-weight:600;">Account aanmaken</span>
-    </div>
+    <button class="btn-primary" id="btn-login" style="margin-top:13px;" type="button">Inloggen</button>
   </div>
 
   <!-- ===================== B2. VERIFICATION CODE (2FA) ===================== -->
@@ -475,12 +449,14 @@
 
   function applyAuthStep(step) {
     current.authStep = step;
+    // "select" must be reachable WHILE logged in (the gear's "andere printer
+    // kiezen"), so it is honored before the logged-in -> progress shortcut.
+    if (step === "select") { showScreen("screen-select"); return; }
     if (current.loggedIn) {
       showScreen("screen-progress");
       return;
     }
     if (step === "code") { showScreen("screen-code"); }
-    else if (step === "select") { showScreen("screen-select"); }
     else { showScreen("screen-login"); }
   }
 
@@ -661,12 +637,16 @@
       if (hasApi()) { window.pywebview.api.logout(); }
     });
 
-    // progress panel: gear returns to printer selection.
-    // For THIS phase the gear is a harmless local nav to the select screen;
-    // Phase 8 wires real navigation/session handling.
+    // progress panel: gear opens printer selection. This asks Python to
+    // (re)fetch the bound device list with the held token and push it +
+    // push_auth_step("select"); the select screen is reachable while logged in
+    // (see applyAuthStep). Falls back to a local nav if the bridge isn't ready.
     $("btn-gear").addEventListener("click", function () {
-      current.loggedIn = false;
-      applyAuthStep("select");
+      if (hasApi() && typeof window.pywebview.api.open_printer_select === "function") {
+        window.pywebview.api.open_printer_select();
+      } else {
+        applyAuthStep("select");
+      }
     });
 
     // controls -> control(command)

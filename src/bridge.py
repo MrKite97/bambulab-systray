@@ -32,6 +32,7 @@ _METHODS = (
     "submit_code",
     "resend_code",
     "select_printer",
+    "open_printer_select",
     "logout",
     "control",
     "resize",
@@ -159,6 +160,11 @@ class Api:
 
     def select_printer(self, device_id):
         return self._call("select_printer", device_id)
+
+    def open_printer_select(self):
+        # Gear button: re-fetch the bound device list and show the select screen
+        # while logged in (no secret crosses; only display rows are pushed back).
+        return self._call("open_printer_select")
 
     def logout(self):
         return self._call("logout")

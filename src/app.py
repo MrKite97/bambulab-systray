@@ -136,6 +136,7 @@ def make_on_message(
     state=None,
     connection_provider=None,
     printer_name="",
+    session_stop=None,
 ):
     """Wrap ``mqtt_client.on_message`` so each report BOTH merges the delta into
     the shared PrintState AND signals the controller to (eventually) repaint --
@@ -177,6 +178,11 @@ def make_on_message(
     def _push_live_state():
         """Serialize the merged shared state and push it to the panel (throttled,
         terminal-safe, fire-and-forget). Never raises into the callback thread."""
+        # Skip once the session is being torn down (logout): a late in-flight
+        # report must not push a stale logged_in=True state that would flip the
+        # panel back off the login screen the logout just landed on.
+        if session_stop is not None and session_stop.is_set():
+            return
         try:
             connection = (
                 connection_provider()
@@ -557,6 +563,7 @@ def make_bridge_handlers(flyout, session, *, start_mqtt=None):
         "submit_code": session.submit_code,
         "resend_code": session.resend_code,
         "select_printer": session.select_printer,
+        "open_printer_select": session.open_printer_select,
         "logout": session.logout,
         "control": make_control_handler(start_mqtt),
         "resize": flyout.resize_to,
@@ -636,6 +643,7 @@ def _wire_client(
     sleep=None,
     flyout=None,
     printer_name="",
+    session_stop=None,
 ):
     """Build + wire the MQTT client for ``(token, serial)`` and return
     ``(client, network_runner)`` WITHOUT starting any thread.
@@ -677,11 +685,28 @@ def _wire_client(
         state=state,
         connection_provider=_connection_provider,
         printer_name=printer_name,
+        session_stop=session_stop,
     )
     client.on_disconnect = make_on_disconnect(controller)
 
     if connect is None:
         connect = make_connect(shutdown_event)
+    # Session-scoped stop (logout): ``session_stop`` ends THIS session's run loop
+    # WITHOUT setting the global shutdown_event (which also drives the tray pump),
+    # so logout leaves the app usable and a later login starts a fresh session.
+    # We check it both before connecting and after the inner connect returns (a
+    # disconnect from stop_session makes loop_forever return cleanly) so the loop
+    # ends instead of immediately reconnecting.
+    if session_stop is not None:
+        _inner_connect = connect
+
+        def connect(client, _inner=_inner_connect):
+            if session_stop.is_set():
+                raise mqtt_client.StopSession()
+            _inner(client)
+            if session_stop.is_set():
+                raise mqtt_client.StopSession()
+
     # Wrap connect so a 401/auth rejection flips the tray to TOKEN_EXPIRED and
     # drives the SAME re-login routine as the menu -- run_session keeps owning
     # the backoff (no second reconnect loop).
@@ -727,6 +752,10 @@ def make_start_mqtt(
         # control handler can target it (Plan 09-02, T-09-06). Stored alongside
         # start_mqtt.client below; the serial is benign and not a secret.
         start_mqtt.serial = serial
+        # Fresh per-session stop event: logout (stop_session) sets it to end THIS
+        # session's run loop without touching the global shutdown_event, and a
+        # later login gets a new (cleared) event so it reconnects cleanly.
+        start_mqtt.session_stop = threading.Event()
         # ``controller`` is read off the attribute so build_gui can late-bind it
         # after the TrayController is constructed (avoids a construction cycle).
         client, network_runner = _wire_client(
@@ -740,6 +769,7 @@ def make_start_mqtt(
             sleep=sleep,
             flyout=start_mqtt.flyout,
             printer_name=start_mqtt.printer_name,
+            session_stop=start_mqtt.session_stop,
         )
         start_mqtt.client = client
         # Bind the live client into the relogin routine so the menu/401 path can
@@ -752,6 +782,9 @@ def make_start_mqtt(
 
     start_mqtt.started = False
     start_mqtt.client = None
+    # Per-session stop event (set by stop_session/logout); None until a session
+    # starts. Kept distinct from the global shutdown_event (which drives quit).
+    start_mqtt.session_stop = None
     # The ACTIVE serial captured when a session starts (Plan 09-02): the control
     # handler reads it to target the user's OWN device. None until start_mqtt runs.
     start_mqtt.serial = None
@@ -767,19 +800,28 @@ def make_start_mqtt(
 def make_stop_session(shutdown_event, start_mqtt):
     """Build the ``stop_session()`` hook the SessionController calls on logout.
 
-    Sets the shutdown event (so the network loop ends) and best-effort
-    disconnects the live client built by ``start_mqtt`` so logout returns to a
-    clean logged-out state. Never raises -- teardown must not break the UI/auth
-    path."""
+    Ends ONLY the current MQTT session: it sets the per-session ``session_stop``
+    event (so ``run_session`` breaks its loop instead of reconnecting), best-effort
+    disconnects the live client, and resets ``start_mqtt.started`` so a LATER login
+    starts a fresh session. It deliberately does NOT set the global
+    ``shutdown_event`` (that also drives the tray pump + signals app quit), so
+    logout leaves the app fully usable. Never raises -- teardown must not break the
+    UI/auth path. ``shutdown_event`` stays in the signature for symmetry with the
+    quit path but is not touched here."""
 
     def stop_session():
-        shutdown_event.set()
+        session_stop = getattr(start_mqtt, "session_stop", None)
+        if session_stop is not None:
+            session_stop.set()  # end THIS session's run loop (no global shutdown)
         client = getattr(start_mqtt, "client", None)
         if client is not None:
             try:
                 client.disconnect()
             except Exception:  # noqa: BLE001 - teardown must never raise
                 logger.debug("client.disconnect() raised during stop_session; ignoring")
+        # Allow a later login to start a fresh session (the old thread has ended).
+        start_mqtt.started = False
+        start_mqtt.client = None
 
     return stop_session
 

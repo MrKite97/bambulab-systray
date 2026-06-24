@@ -182,17 +182,31 @@ class SessionController:
         self._run_async(work)
 
     def logout(self):
-        """Clear the token, stop the running session, reset to the login step.
+        """Clear the token, stop the running session, reset the panel to login.
 
         No stale credential is left behind (T-08-04). Synchronous: these are
         local/in-memory operations, not network calls.
+
+        Pushes a fully logged-OUT state (``logged_in=False``, ``auth_step=login``)
+        rather than only ``push_auth_step("login")``: the page keeps its own
+        ``loggedIn`` flag and, while it is true, forces the progress screen and
+        ignores a bare auth-step push -- so logout from the progress/select
+        screen appeared to "do nothing". Pushing the state resets that flag and
+        lands the panel on the login screen.
         """
         self.token_store.clear_token()
         self._account = None
         self._token = None
         self._devices = []
         self.stop_session()
-        self.flyout.push_auth_step("login")
+        self.flyout.push_state(
+            serialize_state(
+                PrintState(),
+                ConnectionStatus.DISCONNECTED,
+                logged_in=False,
+                auth_step="login",
+            )
+        )
 
     def select_printer(self, device_id):
         """Persist the serial (region preserved), then start the live session.
@@ -224,6 +238,39 @@ class SessionController:
                     printer_name=self._printer_name_for(device_id),
                 )
             )
+
+        self._run_async(work)
+
+    def open_printer_select(self):
+        """Gear button: re-fetch the bound device list and show the select screen.
+
+        Reuses the held token to GET the device list on a WORKER thread, enriches
+        it to display rows, pushes them (``push_devices``) and advances the panel
+        to the select step (``push_auth_step("select")``) -- the same pushes the
+        login flow uses, so the page renders the printer list identically. A 401
+        clears the token and resets to login (T-08-04); a non-401 error surfaces
+        via ``push_error``. No token is missing-guarded -> back to login."""
+        if not self._token:
+            self.flyout.push_auth_step("login")
+            return
+
+        def work():
+            try:
+                devices = self.auth.get_device_list(self._token)
+            except Exception as exc:  # noqa: BLE001
+                if _is_unauthorized(exc):
+                    self.token_store.clear_token()
+                    self._token = None
+                    self.flyout.push_error(_ERR_SESSION_EXPIRED)
+                    self.flyout.push_auth_step("login")
+                    return
+                logger.warning("Fetching the device list failed.")
+                self.flyout.push_error(_ERR_CONNECT)
+                return
+            enriched = self.auth.enrich_devices(devices)
+            self._devices = self._device_rows(enriched)
+            self.flyout.push_devices(self._devices)
+            self.flyout.push_auth_step("select")
 
         self._run_async(work)
 
