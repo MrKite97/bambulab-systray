@@ -235,20 +235,6 @@
   .temp-value { font-size:19px; font-weight:600; color:var(--text-primary); }
   .temp-target { font-size:11px; color:var(--text-secondary); }
 
-  .controls { margin-top:18px; display:flex; gap:9px; }
-  .ctrl-primary {
-    flex:1; height:36px; border:none; border-radius:7px;
-    background:var(--bambu-green); color:#fff; font-size:13px; font-weight:600;
-    cursor:pointer; font-family:inherit;
-  }
-  .ctrl-primary:hover { filter:brightness(1.08); }
-  .ctrl-cancel {
-    flex:1; height:36px; border:1px solid var(--btn-border); border-radius:7px;
-    background:var(--btn-bg); color:var(--text-primary); font-size:13px; font-weight:600;
-    cursor:pointer; font-family:inherit;
-  }
-  .ctrl-cancel:hover { background:var(--btn-hover); }
-
   .status-dot { width:7px; height:7px; border-radius:99px; }
 </style>
 </head>
@@ -309,11 +295,8 @@
       </div>
     </div>
 
-    <!-- controls -->
-    <div class="controls">
-      <button class="ctrl-primary" id="btn-control-primary" type="button">Pauzeren</button>
-      <button class="ctrl-cancel" id="btn-control-cancel" type="button">Annuleren</button>
-    </div>
+    <!-- controls removed: Bambu firmware blocks third-party cloud pause/resume/
+         stop (err_code 84033543), so the app is read-only monitoring. -->
   </div>
 
   <!-- ===================== B1. LOGIN (credentials) ===================== -->
@@ -577,22 +560,8 @@
     $("pp-bed").textContent = String(Math.round(Number(state.bed) || 0));
     $("pp-bed-target").textContent = String(Math.round(Number(state.bedTarget) || 0));
 
-    // stateful primary control label
-    var primaryLabel = (status === "printing") ? "Pauzeren"
-      : (status === "paused") ? "Hervatten"
-      : "Opnieuw printen";
-    var primaryBtn = $("btn-control-primary");
-    primaryBtn.textContent = primaryLabel;
-    primaryBtn.style.background = color;
-
-    // The primary control only has a real cloud command while printing (pause)
-    // or paused (resume). For done/error/idle the label is "Opnieuw printen" but
-    // there is NO cloud reprint command -- so DISABLE the button (honest: it
-    // publishes nothing) rather than fake a reprint. (CONTEXT LOCKED, T-09-08)
-    var primaryActive = (status === "printing") || (status === "paused");
-    primaryBtn.disabled = !primaryActive;
-    primaryBtn.style.opacity = primaryActive ? "" : "0.45";
-    primaryBtn.style.cursor = primaryActive ? "pointer" : "default";
+    // (pause/resume/cancel controls were removed: Bambu firmware blocks
+    // third-party cloud control, so the panel is read-only monitoring.)
 
     syncHeight();
   }
@@ -651,22 +620,8 @@
       }
     });
 
-    // controls -> control(command)
-    $("btn-control-primary").addEventListener("click", function () {
-      if (!hasApi()) { return; }
-      // Only printing->pause and paused->resume publish a command. For any other
-      // status (done/error/idle, the "Opnieuw printen" case) return WITHOUT
-      // calling the api -- there is NO cloud reprint command, so never fake one.
-      // (Defense-in-depth: the button is also disabled for these statuses.)
-      var cmd = (current.status === "printing") ? "pause"
-        : (current.status === "paused") ? "resume"
-        : null;
-      if (cmd === null) { return; }
-      window.pywebview.api.control(cmd);
-    });
-    $("btn-control-cancel").addEventListener("click", function () {
-      if (hasApi()) { window.pywebview.api.control("stop"); }
-    });
+    // (control buttons removed -- no pause/resume/cancel wiring; the cloud
+    // control path is blocked by Bambu firmware, so the panel is read-only.)
   }
 
   // -------------------------------------------------------------------------
