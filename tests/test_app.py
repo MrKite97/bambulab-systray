@@ -1260,10 +1260,10 @@ def test_main_has_no_console_login():
     assert "getpass" not in src
 
 
-def test_main_logged_out_start_sets_neutral_glyph_and_shows_flyout(monkeypatch):
+def test_main_logged_out_start_sets_neutral_glyph_and_does_not_show_flyout(monkeypatch):
     """With no stored token, bootstrap returns False; main() leaves the LOGGED-OUT
-    neutral glyph (render_icon(None)) on the icon and SHOWS the flyout so the user
-    can log in via the panel."""
+    neutral glyph on the icon and does NOT auto-show the flyout (the app lives
+    silently in the tray; the user opens the panel by clicking the tray icon)."""
 
     class OkGuard:
         def acquire(self):
@@ -1286,16 +1286,18 @@ def test_main_logged_out_start_sets_neutral_glyph_and_shows_flyout(monkeypatch):
     rc = app.main(argv=[], guard=OkGuard(), webview=fake_webview)
 
     assert rc == 0
-    # The icon shows the neutral logged-out glyph (render_icon(None)). This is set
-    # before start (it does NOT touch the web page, so it is safe pre-start).
+    # The icon shows the neutral logged-out glyph. This is set before start (it
+    # does NOT touch the web page, so it is safe pre-start).
     assert fake_icon.icon is neutral
-    # The show is DEFERRED to the DOM-loaded event -- showing the window before
-    # webview.start() raised "Main window failed to start".
+    # bootstrap is DEFERRED to the DOM-loaded event (pushing before webview.start()
+    # raised "Main window failed to start").
     assert "show" not in flyout.events
     assert "on_loaded" in flyout.events
-    # Firing the loaded event shows the flyout so the login screen is visible.
+    # Firing the loaded event runs bootstrap but must NOT auto-show the flyout --
+    # the app stays in the tray until the user clicks the icon.
     flyout.fire_loaded()
-    assert "show" in flyout.events
+    assert "show" not in flyout.events
+    assert "bootstrap_from_stored" in session.calls
 
 
 def test_relogin_menu_drives_panel_not_console(monkeypatch):

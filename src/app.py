@@ -1247,21 +1247,19 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     # SAME glyph the pump paints, so there's no brief legacy-dot flash.
     icon.icon = render.render_printer_icon(0, "neutral", logged_out=True)
 
-    # Defer the bootstrap + initial show to the window's DOM-loaded event. Both
-    # push to the page (push_auth_step / evaluate_js) and SHOW the window, which
-    # is only safe AFTER webview.start() is running and the page DOM is ready --
-    # calling them eagerly here raises "Main window failed to start" (the v2
-    # startup crash). pywebview fires window.events.loaded at exactly that point.
+    # Defer the bootstrap to the window's DOM-loaded event: it pushes to the page
+    # (push_auth_step / evaluate_js), which is only safe AFTER webview.start() is
+    # running and the page DOM is ready -- calling it eagerly here raises "Main
+    # window failed to start". pywebview fires window.events.loaded at that point.
     def _on_window_loaded():
         # Runs after the GUI loop is up and the page DOM is loaded, so
-        # bootstrap_from_stored's push_* and flyout.show() are now safe.
-        # Decide logged-in vs login screen from the stored token + serial: a
-        # validated stored session starts MQTT (via start_mqtt) and opens on
-        # progress; a rejected/absent token resets the panel to the login screen.
+        # bootstrap_from_stored's push_* are now safe. Decide logged-in vs login
+        # from the stored token + serial: a validated stored session starts MQTT
+        # (via start_mqtt) and primes the progress panel; a rejected/absent token
+        # primes the login screen. The flyout is NOT shown here -- the app lives
+        # silently in the tray and the user opens the panel by clicking the tray
+        # icon (auto-popping the window on every launch was intrusive).
         session.bootstrap_from_stored()
-        # Show the flyout so the login screen is visible when logged out (the
-        # user logs in entirely in the panel -- no console prompt).
-        flyout.show()
 
     flyout.on_loaded(_on_window_loaded)
 
