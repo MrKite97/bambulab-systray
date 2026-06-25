@@ -37,7 +37,11 @@ def test_publish_command_pause_sends_exact_json_to_request_topic():
     assert len(client.published) == 1
     topic, payload = client.published[0]
     assert topic == "device/00M00A/request"
-    assert json.loads(payload) == {"print": {"command": "pause"}}
+    # The printer ignores a control message without sequence_id; the verified
+    # shape carries sequence_id + param (OpenBambuAPI / pybambu).
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "pause", "param": ""}
+    }
 
 
 def test_publish_command_resume_sends_exact_json():
@@ -46,7 +50,9 @@ def test_publish_command_resume_sends_exact_json():
 
     topic, payload = client.published[0]
     assert topic == "device/S/request"
-    assert json.loads(payload) == {"print": {"command": "resume"}}
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "resume", "param": ""}
+    }
 
 
 def test_publish_command_stop_sends_exact_json():
@@ -55,7 +61,9 @@ def test_publish_command_stop_sends_exact_json():
 
     topic, payload = client.published[0]
     assert topic == "device/S/request"
-    assert json.loads(payload) == {"print": {"command": "stop"}}
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "stop", "param": ""}
+    }
 
 
 def test_publish_command_payload_is_json_string_not_dict():
@@ -92,21 +100,27 @@ def test_pause_wrapper_publishes_pause_payload():
     control.pause(client, "S")
     topic, payload = client.published[0]
     assert topic == "device/S/request"
-    assert json.loads(payload) == {"print": {"command": "pause"}}
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "pause", "param": ""}
+    }
 
 
 def test_resume_wrapper_publishes_resume_payload():
     client = FakeMqttClient()
     control.resume(client, "S")
     _topic, payload = client.published[0]
-    assert json.loads(payload) == {"print": {"command": "resume"}}
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "resume", "param": ""}
+    }
 
 
 def test_stop_wrapper_publishes_stop_payload():
     client = FakeMqttClient()
     control.stop(client, "S")
     _topic, payload = client.published[0]
-    assert json.loads(payload) == {"print": {"command": "stop"}}
+    assert json.loads(payload) == {
+        "print": {"sequence_id": "0", "command": "stop", "param": ""}
+    }
 
 
 def test_allowlist_is_exactly_pause_resume_stop():

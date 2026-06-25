@@ -39,8 +39,14 @@ def publish_command(client, serial: str, command: str) -> None:
             f"(allowed: {_ALLOWED_COMMANDS})"
         )
     topic = f"device/{serial}/request"
-    payload = json.dumps({"print": {"command": command}})
-    client.publish(topic, payload)
+    # Verified payload shape (OpenBambuAPI mqtt.md + pybambu commands.py): the
+    # printer IGNORES a control message that lacks ``sequence_id`` -- it must be
+    # present (a non-empty value) for the firmware to even process the command,
+    # alongside ``param``. Sent at QoS 1 (higher priority) like the official app.
+    payload = json.dumps(
+        {"print": {"sequence_id": "0", "command": command, "param": ""}}
+    )
+    client.publish(topic, payload, qos=1)
     logger.debug("Published control command %s to %s", command, topic)
 
 

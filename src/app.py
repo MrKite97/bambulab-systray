@@ -36,6 +36,7 @@ username / Authorization header are NEVER logged. Only ``gcode_state`` /
 """
 
 import argparse
+import json
 import logging
 import threading
 import time
@@ -129,6 +130,32 @@ def _display_signature(serialized: dict) -> tuple:
     return tuple(serialized.get(k) for k in _DISPLAYED_KEYS)
 
 
+# A pause/resume/stop the printer REJECTED. Newer Bambu firmware verifies control
+# commands and rejects unsigned third-party cloud-MQTT ones (HMS 0500-0500-0001-
+# 0007, "MQTT Command verification failed"), echoing the command back with a
+# non-zero ``err_code``. We surface that so a control button is not a silent no-op.
+_CONTROL_COMMANDS = frozenset({"pause", "resume", "stop"})
+_ERR_CONTROL_REJECTED = (
+    "De printer weigerde het commando. Pauzeren/hervatten/annuleren via de "
+    "Bambu-cloud is door de printer-firmware geblokkeerd."
+)
+
+
+def _control_rejection_error(msg) -> str | None:
+    """Return a user-facing error if ``msg`` is a control-command echo the printer
+    REJECTED (non-zero ``err_code``), else None. Guarded against malformed input
+    so untrusted broker data can never crash the network thread (T-01-11)."""
+    try:
+        print_obj = json.loads(msg.payload).get("print", {})
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(print_obj, dict):
+        return None
+    if print_obj.get("command") in _CONTROL_COMMANDS and print_obj.get("err_code"):
+        return _ERR_CONTROL_REJECTED
+    return None
+
+
 def make_on_message(
     controller,
     *,
@@ -210,6 +237,15 @@ def make_on_message(
     def _on_message(client, userdata, msg):
         mqtt_client.on_message(client, userdata, msg)  # guarded delta-merge
         controller.on_state_change()  # enqueue a repaint (UI thread applies it)
+        if flyout is not None:
+            # Surface a rejected control command (e.g. firmware-blocked pause) so
+            # the panel button is not a silent no-op. Best-effort; never raises.
+            rejected = _control_rejection_error(msg)
+            if rejected is not None:
+                try:
+                    flyout.push_error(rejected)
+                except Exception:  # noqa: BLE001 - panel push is best-effort
+                    logger.debug("flyout push_error failed on control reject; continuing")
         if flyout is not None and state is not None:
             _push_live_state()  # live panel update (throttled, terminal-safe)
 

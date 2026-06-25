@@ -1510,6 +1510,36 @@ def test_control_handler_is_noop_with_no_session():
     assert fake_control2.calls == []
 
 
+# --- control-command rejection surfacing (firmware-blocked pause/resume) ----
+
+
+class _FakeMsg:
+    def __init__(self, payload):
+        self.payload = payload if isinstance(payload, bytes) else payload.encode()
+
+
+def test_control_rejection_error_flags_rejected_command():
+    """A control-command echo with a non-zero err_code yields the user error so a
+    firmware-blocked pause/resume is not a silent no-op."""
+    msg = _FakeMsg(json.dumps({"print": {"command": "pause", "err_code": 84033543}}))
+    assert app._control_rejection_error(msg) == app._ERR_CONTROL_REJECTED
+
+
+def test_control_rejection_error_none_for_accepted_or_normal_reports():
+    """No error for a control echo with err_code 0/absent, a normal status
+    report, or malformed input (guarded -- never raises)."""
+    assert app._control_rejection_error(
+        _FakeMsg(json.dumps({"print": {"command": "pause", "err_code": 0}}))
+    ) is None
+    assert app._control_rejection_error(
+        _FakeMsg(json.dumps({"print": {"command": "resume"}}))
+    ) is None
+    assert app._control_rejection_error(
+        _FakeMsg(json.dumps({"print": {"gcode_state": "RUNNING", "mc_percent": 42}}))
+    ) is None
+    assert app._control_rejection_error(_FakeMsg(b"not json")) is None
+
+
 def test_make_start_mqtt_captures_active_serial(monkeypatch):
     """When start_mqtt runs it stores the serial it was started with on
     start_mqtt.serial (alongside start_mqtt.client) so control targets the
