@@ -696,11 +696,10 @@
   var BLUR_GRACE_MS = 800;
   window.addEventListener('blur', function () {
     if (!hasApi()) { return; }
-    // Only the glanceable progress panel auto-hides on click-away. The login /
-    // code / select screens MUST stay open so the user can switch to their
-    // browser or mail (e.g. to fetch the 6-digit 2FA code) and come back to the
-    // same screen without it vanishing.
-    if (current.screen !== "screen-progress") { return; }
+    // Click-away dismisses the panel -- EXCEPT the 2FA code screen, which must
+    // stay open so the user can switch to their mail/browser to fetch the
+    // 6-digit code and come back to it. (login / select / progress all dismiss.)
+    if (current.screen === "screen-code") { return; }
     var shownAt = window.__flyoutShownAt || 0;
     if (Date.now() - shownAt < BLUR_GRACE_MS) { return; }
     window.pywebview.api.hide();

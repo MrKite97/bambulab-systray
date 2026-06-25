@@ -136,7 +136,13 @@ class FlyoutWindow:
         Re-anchoring keeps the bottom edge glued above the taskbar as the height
         changes (the window grows upward). Non-positive / non-numeric heights are
         ignored and nothing here raises into the GUI loop (a resize hiccup must
-        never break the panel)."""
+        never break the panel).
+
+        CRITICAL: only resize/move while the window is actually VISIBLE. On the
+        WebView2 backend ``move``/``resize`` UN-HIDE a hidden window, so applying
+        them on a background render (e.g. a live MQTT report's push when the panel
+        is closed) would pop the flyout open by itself. When hidden we just record
+        the height so the next :meth:`show` anchors to it."""
         if self._window is None:
             return
         try:
@@ -146,6 +152,8 @@ class FlyoutWindow:
         if h <= 0:
             return
         self._height = h
+        if not self.visible:
+            return  # don't un-hide a closed panel; show() will use _height
         try:
             self._window.resize(self.WIDTH, h)
         except Exception:  # noqa: BLE001 - a resize failure must not break the UI

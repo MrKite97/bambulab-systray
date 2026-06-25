@@ -147,16 +147,33 @@ def test_show_arms_blur_grace_stamp():
     assert stamps == ["window.__flyoutShownAt = Date.now()"]
 
 
-def test_resize_to_resizes_and_reanchors_bottom_right():
-    """resize_to() resizes to (WIDTH, height) and re-anchors bottom-right using
-    the NEW height so the flyout stays glued above the taskbar as it grows."""
+def test_resize_to_resizes_and_reanchors_bottom_right_when_visible():
+    """While VISIBLE, resize_to() resizes to (WIDTH, height) and re-anchors
+    bottom-right using the NEW height so the flyout stays glued above the
+    taskbar as it grows."""
     api, fake, fw = _make(screen_size=(1920, 1080))
     fw.create()
+    fw.show()  # must be visible: resize/move would otherwise un-hide it
     fw.resize_to(440)
     assert fake.window.resized[-1] == (FlyoutWindow.WIDTH, 440)
     expected_x = 1920 - FlyoutWindow.WIDTH - FlyoutWindow.MARGIN
     expected_y = 1080 - 440 - FlyoutWindow.TASKBAR_HEIGHT - FlyoutWindow.MARGIN
     assert fake.window.moved[-1] == (expected_x, expected_y)
+
+
+def test_resize_to_while_hidden_does_not_resize_or_move():
+    """While HIDDEN, resize_to() must NOT resize/move (those un-hide the WebView2
+    window, popping the panel open by itself on a background render) -- it only
+    records the height for the next show()."""
+    api, fake, fw = _make(screen_size=(1920, 1080))
+    fw.create()  # created hidden, never shown -> visible is False
+    fw.resize_to(440)
+    assert fake.window.resized == []   # no resize while hidden
+    assert fake.window.moved == []     # no move while hidden
+    # The height is remembered: a later show() anchors using it.
+    fw.show()
+    expected_y = 1080 - 440 - FlyoutWindow.TASKBAR_HEIGHT - FlyoutWindow.MARGIN
+    assert fake.window.moved[-1][1] == expected_y
 
 
 def test_resize_to_ignores_nonpositive_and_nonnumeric():
