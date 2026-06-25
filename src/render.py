@@ -197,14 +197,34 @@ def detect_windows_theme() -> str:
 
 # --- Printer tray glyph, recreated 1:1 from the design handoff -----------------
 # Source: design_handoff_printer_tray/3D-printer voortgang.dc.html, the default
-# "printer" tray SVG. The design draws in a 0..24 viewBox; we scale every
-# coordinate to the 64px canvas (_PSCALE) and let Windows downscale to the tray
-# size. The shape is a real printer: a top GANTRY bar, two side POSTS, a PRINT
+# "printer" tray SVG. The design draws in a 0..24 viewBox; the printer itself only
+# occupies x3.3..20.7 / y3.8..20.4 of that box, leaving wide padding. Scaling the
+# raw viewBox to 64px would carry that padding through and Windows would render a
+# small glyph. Instead we FIT the printer's bounding box to (most of) the canvas
+# with a tiny margin (_PRN_MARGIN), so it fills the tray cell like the system
+# icons. The shape is a real printer: a top GANTRY bar, two side POSTS, a PRINT
 # HEAD hanging from the gantry, and a BUILD PLATE -- all in the status color. The
 # build area between them fills bottom-to-top with translucent MATERIAL grey
 # (never the status color) by progress, so the colored contour stays legible even
 # at a 1% sliver. Logged out / neutral: grey frame, no fill.
-_PSCALE = ICON_SIZE / 24.0  # design viewBox is 24 units wide/tall
+
+# Printer bounding box in design units (gantry-left .. plate-right etc.).
+_PRN_BBOX = (3.3, 3.8, 20.7, 20.4)  # x0, y0, x1, y1  -> 17.4 wide, 16.6 tall
+_PRN_MARGIN = 2.0  # px of breathing room around the glyph in the 64px canvas
+_PRN_CX = 12.0     # design-space centre (viewBox + bbox centres ~coincide)
+# Uniform scale that maps the larger bbox dimension to (canvas - 2*margin).
+_PRN_FIT = (ICON_SIZE - 2 * _PRN_MARGIN) / (_PRN_BBOX[2] - _PRN_BBOX[0])
+
+
+def _ps(v: float) -> float:
+    """Design (0..24) COORDINATE -> 64px canvas coordinate (centred + fitted)."""
+    return ICON_SIZE / 2.0 + (v - _PRN_CX) * _PRN_FIT
+
+
+def _pl(v: float) -> float:
+    """Design LENGTH (radius/width) -> px length (no centre offset)."""
+    return v * _PRN_FIT
+
 
 # Build area the printed object fills (design clipPath rect x6 y6.5 w12 h11.5).
 # The bottom equals the build-plate top, so the fill runs flush to the plate.
@@ -249,10 +269,6 @@ def render_printer_icon(
     img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    def s(v: float) -> float:
-        """Scale a design (0..24) coordinate to the 64px canvas."""
-        return v * _PSCALE
-
     # Build-area fill FIRST (so the frame + print head drawn next win on overlap,
     # keeping the colored contour legible even at high fill).
     if not logged_out and status != "neutral":
@@ -262,21 +278,21 @@ def render_printer_icon(
             top = max(_PRN_BUILD_TOP, _PRN_BUILD_BOTTOM - fill_h)
             r = min(1.0, fill_h / 2.0, _PRN_BUILD_W / 2.0)  # clamp so PIL never errors
             d.rounded_rectangle(
-                [s(_PRN_BUILD_X), s(top),
-                 s(_PRN_BUILD_X + _PRN_BUILD_W), s(_PRN_BUILD_BOTTOM)],
-                radius=s(r), fill=material,
+                [_ps(_PRN_BUILD_X), _ps(top),
+                 _ps(_PRN_BUILD_X + _PRN_BUILD_W), _ps(_PRN_BUILD_BOTTOM)],
+                radius=_pl(r), fill=material,
             )
 
     # Top gantry bar (design rect x4 y3.8 w16 h2 rx1).
-    d.rounded_rectangle([s(4), s(3.8), s(20), s(5.8)], radius=s(1.0), fill=frame_color)
+    d.rounded_rectangle([_ps(4), _ps(3.8), _ps(20), _ps(5.8)], radius=_pl(1.0), fill=frame_color)
     # Two side posts (design path "M5 5.5 V18" / "M19 5.5 V18", stroke 1.9 round).
     _hw = 1.9 / 2.0
-    d.rounded_rectangle([s(5 - _hw), s(5.5), s(5 + _hw), s(18)], radius=s(_hw), fill=frame_color)
-    d.rounded_rectangle([s(19 - _hw), s(5.5), s(19 + _hw), s(18)], radius=s(_hw), fill=frame_color)
+    d.rounded_rectangle([_ps(5 - _hw), _ps(5.5), _ps(5 + _hw), _ps(18)], radius=_pl(_hw), fill=frame_color)
+    d.rounded_rectangle([_ps(19 - _hw), _ps(5.5), _ps(19 + _hw), _ps(18)], radius=_pl(_hw), fill=frame_color)
     # Print head hanging from the gantry (design rect x10.4 y5.4 w3.2 h2.6 rx.7).
-    d.rounded_rectangle([s(10.4), s(5.4), s(13.6), s(8.0)], radius=s(0.7), fill=frame_color)
+    d.rounded_rectangle([_ps(10.4), _ps(5.4), _ps(13.6), _ps(8.0)], radius=_pl(0.7), fill=frame_color)
     # Build plate / base (design rect x3.3 y18 w17.4 h2.4 rx1).
-    d.rounded_rectangle([s(3.3), s(18), s(20.7), s(20.4)], radius=s(1.0), fill=frame_color)
+    d.rounded_rectangle([_ps(3.3), _ps(18), _ps(20.7), _ps(20.4)], radius=_pl(1.0), fill=frame_color)
 
     return img
 

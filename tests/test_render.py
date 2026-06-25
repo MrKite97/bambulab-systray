@@ -360,16 +360,15 @@ def test_detect_windows_theme_returns_valid_value():
 
 # --- render_printer_icon ---------------------------------------------------
 
-# Geometry sampled in tests, mirroring the design coords scaled to 64px
-# (render._PSCALE = 64/24). The build column centre is design x12 -> 32; the
-# print head sits over that column near the top, so a pixel there is a FRAME
-# pixel; the plate top is design y18 -> 48.
-from src.render import _MATERIAL_FILL  # noqa: E402 - test-only geometry mirror
+# Geometry sampled in tests, mirroring render's bbox-fit transform (_ps maps a
+# design coord to the 64px canvas). The build column centre is design x12 -> 32;
+# the print head sits over that column near the top, so a pixel there is a FRAME
+# pixel; the plate top is design y18.
+from src.render import _MATERIAL_FILL, _ps  # noqa: E402 - test-only geometry mirror
 
-_PSCALE = ICON_SIZE / 24.0
-_BUILD_CENTER_X = round(12 * _PSCALE)   # 32 (centre of the build column)
-_BUILD_TOP = round(6.8 * _PSCALE)       # ~18: lands in the print head (a frame pixel)
-_PLATE_TOP = round(18 * _PSCALE)        # 48: build-area bottom / plate top
+_BUILD_CENTER_X = round(_ps(12))    # 32 (centre of the build column)
+_BUILD_TOP = round(_ps(6.5))        # lands in the print head (a frame pixel)
+_PLATE_TOP = round(_ps(18))         # build-area bottom / plate top
 
 
 def _fill_column_height(img, x, theme="dark"):
