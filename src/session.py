@@ -266,8 +266,21 @@ class SessionController:
                 if _is_unauthorized(exc):
                     self.token_store.clear_token()
                     self._token = None
+                    # Push a fully logged-OUT state (not a bare auth-step): the page
+                    # keeps its own loggedIn flag and, while it is true, a bare
+                    # push_auth_step("login") routes to the progress screen -- which
+                    # snapped the just-opened settings view back to print. Flipping
+                    # loggedIn=False lands the panel on the login screen (same fix
+                    # logout() applies). The error banner explains why.
                     self.flyout.push_error(_ERR_SESSION_EXPIRED)
-                    self.flyout.push_auth_step("login")
+                    self.flyout.push_state(
+                        serialize_state(
+                            PrintState(),
+                            ConnectionStatus.DISCONNECTED,
+                            logged_in=False,
+                            auth_step="login",
+                        )
+                    )
                     return
                 logger.warning("Fetching the device list failed.")
                 self.flyout.push_error(_ERR_CONNECT)

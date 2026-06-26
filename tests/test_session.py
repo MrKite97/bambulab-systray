@@ -327,7 +327,14 @@ def test_open_printer_select_without_token_goes_to_login():
 
 
 def test_open_printer_select_401_clears_token_and_resets_login():
-    """A 401 on the device fetch clears the token and resets to login (no reuse)."""
+    """A 401 on the device fetch clears the token and resets to login (no reuse).
+
+    Pushes a fully logged-OUT state (not a bare push_auth_step("login")): the page
+    keeps its own loggedIn flag, and while it is true a bare auth-step routes to the
+    progress screen -- which snapped the just-opened settings view back to print.
+    Flipping loggedIn=False lands the panel on the login screen (same fix logout()
+    applies), and an error banner explains the expiry.
+    """
     err = RuntimeError("401 Unauthorized")
     auth = FakeAuth(devices_exc=err)
     c, auth, ts, st, fly = _make_controller(auth=auth)
@@ -335,7 +342,10 @@ def test_open_printer_select_401_clears_token_and_resets_login():
     c.open_printer_select()
     assert ts.cleared == 1
     assert c._token is None
-    assert fly.steps()[-1] == "login"
+    state = fly.payloads("push_state")[-1]
+    assert state["loggedIn"] is False
+    assert state["authStep"] == "login"
+    assert fly.errors()[-1]  # session-expired banner shown
 
 
 # --------------------------------------------------------------------------- #

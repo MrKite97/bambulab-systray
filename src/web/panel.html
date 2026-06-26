@@ -374,8 +374,21 @@
     loggedIn: false,
     authStep: "login",   // "login" | "code" | "select"
     status: "idle",      // drives which control command to send
-    screen: "screen-login" // the visible screen id (drives the click-away rule)
+    screen: "screen-login", // the visible screen id (drives the click-away rule)
+    // The screen the USER deliberately navigated to and expects to stay on while
+    // logged in (the gear's "andere printer kiezen" -> "screen-select"). Background
+    // pushes -- the throttled MQTT live-push (applyState) AND any auth-step push
+    // (applyAuthStep) -- must NOT navigate away from a pinned screen. It is set the
+    // moment the settings screen is shown and cleared ONLY by an explicit
+    // navigation (a logged-out state, a real 2FA "code" step, or selecting a
+    // printer). Without this, EITHER push path could snap the open settings view
+    // back to the progress screen. null = nothing pinned (follow the normal rule).
+    pinnedScreen: null
   };
+
+  // Screens the user can deliberately PARK on while logged in (must survive any
+  // background state/auth push). Only the select/settings screen qualifies today.
+  var PINNABLE_SCREENS = { "screen-select": true };
 
   // ---- status -> Dutch label + token color for the progress panel ----
   var STATUS_LABELS = {
@@ -399,6 +412,9 @@
     return !!(window.pywebview && window.pywebview.api);
   }
 
+  // Actually swap the visible screen. Low-level: callers decide WHETHER to
+  // navigate (see navigate / the guards). Pinning is handled by navigate, not
+  // here, so syncHeight-only callers don't disturb the pin.
   function showScreen(id) {
     current.screen = id;  // remembered for the click-away (blur) rule below
     var ids = ["screen-progress", "screen-login", "screen-code", "screen-select"];
@@ -407,6 +423,22 @@
       if (el) { el.classList.toggle("active", ids[i] === id); }
     }
     syncHeight();
+  }
+
+  // Navigate to a screen as the result of a DELIBERATE action (a user click or an
+  // explicit auth transition). This is the only path that updates the pin:
+  //  - landing on a pinnable screen (the select/settings screen) PINS it, so no
+  //    later background push can navigate away;
+  //  - landing on any other screen via a deliberate action CLEARS the pin.
+  // Background refreshes (live MQTT applyState, redundant auth-step echoes) must
+  // NOT call this -- they consult the pin instead and leave it untouched.
+  function navigate(id) {
+    if (PINNABLE_SCREENS[id]) {
+      current.pinnedScreen = id;
+    } else {
+      current.pinnedScreen = null;
+    }
+    showScreen(id);
   }
 
   // Resize the window to the rendered content height so the flyout hugs its
@@ -435,14 +467,25 @@
   function applyAuthStep(step) {
     current.authStep = step;
     // "select" must be reachable WHILE logged in (the gear's "andere printer
-    // kiezen"), so it is honored before the logged-in -> progress shortcut.
-    if (step === "select") { showScreen("screen-select"); return; }
+    // kiezen"), so it is honored before the logged-in -> progress shortcut. This
+    // is the deliberate navigation that PINS the settings screen.
+    if (step === "select") { navigate("screen-select"); return; }
     if (current.loggedIn) {
-      showScreen("screen-progress");
+      // The page is logged in. A non-select auth-step push is usually a redundant
+      // echo (the throttled live-push and several Python paths default authStep to
+      // "login"). It must NOT yank the user off a settings screen they pinned --
+      // e.g. the gear's own device-list fetch failing with a 401 pushes
+      // push_auth_step("login"), which previously routed straight to progress and
+      // snapped the just-opened settings view back. While a settings screen is
+      // pinned, ignore the push and stay put. Otherwise fall through to progress.
+      if (current.pinnedScreen) { return; }
+      navigate("screen-progress");
       return;
     }
-    if (step === "code") { showScreen("screen-code"); }
-    else { showScreen("screen-login"); }
+    // Logged OUT: a real auth transition. This clears any stale pin (navigate
+    // does it) so the auth screens are never blocked by a leftover pin.
+    if (step === "code") { navigate("screen-code"); }
+    else { navigate("screen-login"); }
   }
 
   function applyError(msg) {
@@ -499,6 +542,10 @@
       row.appendChild(chevron);
 
       row.addEventListener("click", function () {
+        // Picking a printer is a deliberate navigation AWAY from the settings
+        // screen: unpin so the logged-in progress state Python pushes back
+        // (auth_step "select", but loggedIn) is allowed to land on progress.
+        current.pinnedScreen = null;
         if (hasApi()) { window.pywebview.api.select_printer(dev.id); }
       });
 
@@ -516,13 +563,26 @@
     if (state.theme) { applyTheme(state.theme); }
 
     if (!current.loggedIn) {
-      // logged out -> show the auth step (login/code/select)
+      // logged out -> show the auth step (login/code/select). A logged-out push is
+      // an explicit transition (e.g. logout, session-expired) and clears any pin
+      // via applyAuthStep -> navigate, so the auth screens are reachable again.
       applyAuthStep(current.authStep || "login");
       return;
     }
 
     // ----- logged-in progress panel -----
-    showScreen("screen-progress");
+    // A live state push must never yank the user off a screen they deliberately
+    // opened. The select/settings screen is reachable WHILE logged in (the gear's
+    // "andere printer kiezen"), and the throttled MQTT live-push (Plan 09-01)
+    // delivers a state push ~1s after the panel opens (and on every idle
+    // snapshot). So: always refresh the progress-panel DATA below (kept fresh in
+    // the background), but only SWITCH to the progress screen when the user has
+    // NOT pinned a settings screen. This is a background refresh, so it consults
+    // the pin and never calls navigate() (which would mutate the pin).
+    var keepCurrent = !!current.pinnedScreen;
+    if (!keepCurrent) {
+      showScreen("screen-progress");
+    }
 
     var status = state.status || "idle";
     var color = STATUS_VARS[status] || STATUS_VARS.idle;
@@ -563,7 +623,12 @@
     // (pause/resume/cancel controls were removed: Bambu firmware blocks
     // third-party cloud control, so the panel is read-only monitoring.)
 
-    syncHeight();
+    // Only re-fit the window when the progress screen is actually showing. While
+    // the user is parked on the select screen we just refreshed background data,
+    // so don't resize to the (hidden) progress layout or jiggle the open panel.
+    if (!keepCurrent) {
+      syncHeight();
+    }
   }
 
   // expose Python -> page entry points
