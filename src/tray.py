@@ -87,13 +87,22 @@ class TrayController:
         Non-active displays debounce purely on the :class:`DisplayState` (so a
         connection/token transition repaints exactly once and an unchanged
         derived display repaints zero times). ACTIVE_PRINT additionally keys on
-        the shown icon text (minute / '10u') and integer percent, so the active
-        minute/percent still drives repaints. Equal keys mean an identical
-        on-screen result."""
+        the gcode-derived status (printing vs paused -- the frame color), the
+        shown icon text (minute / '10u') and integer percent, so the active
+        color/minute/percent each drive repaints. The status is load-bearing:
+        RUNNING and PAUSE both derive to ACTIVE_PRINT, so without it a
+        printing<->paused transition (same shown minute, same integer percent)
+        would key identically and the amber/blue recolor would be debounced away.
+        Equal keys mean an identical on-screen result."""
         display = status.derive_display_state(self._state, self._status, self._now())
         if display is status.DisplayState.ACTIVE_PRINT:
-            return (display, render.icon_text(self._state), self._state.mc_percent)
-        return (display, None, None)
+            return (
+                display,
+                render.status_from_gcode_state(self._state.gcode_state),
+                render.icon_text(self._state),
+                self._state.mc_percent,
+            )
+        return (display, None, None, None)
 
     def reset_to_logged_out(self):
         """Drop the tray back to the neutral logged-out glyph (logout).

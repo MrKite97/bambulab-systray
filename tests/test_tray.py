@@ -43,6 +43,17 @@ def _active(percent, remaining):
     )
 
 
+def _paused(percent, remaining):
+    """A paused-print PrintState (PAUSE) with the given percent/remaining.
+
+    PAUSE is also an active print (is_active_print includes RUNNING + PAUSE) so
+    it derives to DisplayState.ACTIVE_PRINT -- the same display as RUNNING. Only
+    the frame COLOR differs (blue printing vs amber paused)."""
+    return PrintState(
+        gcode_state="PAUSE", mc_percent=percent, mc_remaining_time=remaining
+    )
+
+
 class _FakeClock:
     """A tiny advanceable monotonic clock (no real waits). Tests read the current
     value via __call__ (so it drops in as TrayController(now=...)) and move time
@@ -143,6 +154,38 @@ def test_percent_change_triggers_repaint():
     ctrl.pump_once()
 
     assert icon.icon_set_count == 2
+
+
+def test_running_to_pause_triggers_repaint_same_percent_same_minute():
+    """REGRESSION (paused-icon-no-recolor): a RUNNING->PAUSE transition with the
+    SAME percent AND the SAME shown minute MUST repaint -- the frame color goes
+    blue->amber, so the gcode-derived status is part of the debounce key. Without
+    it the recolor was debounced away and the icon stayed blue while paused."""
+    icon = FakeIcon()
+    state = _active(42, 83)  # RUNNING, "1:23"
+    ctrl = _connected(icon, state)
+
+    ctrl.on_state_change()
+    ctrl.pump_once()  # paint #1: printing (blue)
+    assert icon.icon_set_count == 1
+
+    state.gcode_state = "PAUSE"  # same percent (42), same minute (83 -> "1:23")
+    ctrl.on_state_change()
+    ctrl.pump_once()  # MUST repaint -> paused (amber)
+
+    assert icon.icon_set_count == 2
+    # Still an active print, so the tooltip body is unchanged (status drives the
+    # icon COLOR, not the tooltip wording).
+    assert icon.title == "42% — nog 1u 23m"
+
+
+def test_running_pause_keys_differ():
+    """The debounce key itself must differ between RUNNING and PAUSE at identical
+    percent/remaining (locks the color-determining input into the key)."""
+    running = _connected(FakeIcon(), _active(42, 83))
+    paused = _connected(FakeIcon(), _paused(42, 83))
+
+    assert running._key() != paused._key()
 
 
 def test_minute_change_triggers_repaint():
