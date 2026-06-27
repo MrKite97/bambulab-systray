@@ -22,6 +22,7 @@ construction:
 from src.render import detect_windows_theme, status_from_gcode_state
 from src.state import PrintState
 from src.status import ConnectionStatus
+from src.version import __version__
 
 # The js_api method names the page calls (window.pywebview.api.<name>). This is
 # the LOCKED set from panel.html; Phases 8/9 supply real handlers behind them.
@@ -100,6 +101,10 @@ def serialize_state(
         "etaLabel": _eta_label(state.mc_remaining_time),
         "printerName": printer_name,
         "theme": theme or detect_windows_theme(),
+        # Static module constant (the single literal in src/version.py), NOT read
+        # from PrintState -- no secret crosses the bridge (T-10-01). Present here
+        # so it rides the initial pull and paints on first load (D-10).
+        "version": __version__,
     }
 
 

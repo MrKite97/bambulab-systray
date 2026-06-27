@@ -363,6 +363,16 @@
   <!-- shared error banner (below whichever screen is active) -->
   <div class="error-banner" id="error-banner"></div>
 
+  <!-- ===================== FOOTER (version, all screens) ===================== -->
+  <!-- Lives inside .flyout but AFTER all screens, so it shows on every screen and
+       is measured by syncHeight. Muted/small/bottom-anchored (D-09); applyState
+       overwrites the text from state.version (the single source still wins). -->
+  <div id="pp-version-footer"
+       style="margin-top:14px; text-align:center; font-size:11px;
+              color:var(--text-secondary); user-select:none;">
+    <span id="pp-version">v2.1.0</span>
+  </div>
+
 </div>
 
 <script>
@@ -556,6 +566,15 @@
 
   function applyState(state) {
     state = state || {};
+
+    // Footer version: set BEFORE the logged-out early return so it shows on the
+    // login/code screens too. Guarded so a live push that omits `version`
+    // (throttled MQTT) does not blank it. Display-only "v" prefix.
+    if (state.version) {
+      var vEl = document.getElementById("pp-version");
+      if (vEl) { vEl.textContent = "v" + String(state.version).replace(/^v/i, ""); }
+    }
+
     current.loggedIn = !!state.loggedIn;
     if (state.status) { current.status = state.status; }
     if (state.authStep) { current.authStep = state.authStep; }

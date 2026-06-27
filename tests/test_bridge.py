@@ -14,6 +14,7 @@ import pytest
 from src.bridge import Api, serialize_state
 from src.state import PrintState
 from src.status import ConnectionStatus
+from src.version import __version__
 
 
 def _running_state():
@@ -129,6 +130,22 @@ def test_serialize_state_auth_step_override():
         state, ConnectionStatus.CONNECTED, logged_in=False, auth_step="code"
     )
     assert out["authStep"] == "code"
+
+
+def test_serialize_state_carries_static_version():
+    # The version is a static module constant (single source in src/version.py),
+    # present on the serialized state so the panel paints it on first load (D-10).
+    out = serialize_state(_running_state(), ConnectionStatus.CONNECTED, logged_in=True)
+    assert out["version"] == __version__
+    assert out["version"] == "2.1.0"
+    assert out["version"]  # not empty
+
+
+def test_get_initial_state_no_provider_carries_version():
+    # The no-provider fallback also runs through serialize_state, so it inherits
+    # the version field with no separate injection.
+    out = Api().get_initial_state()
+    assert out["version"] == __version__
 
 
 # --------------------------------------------------------------------------- #
