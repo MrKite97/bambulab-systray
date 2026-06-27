@@ -37,6 +37,13 @@ _METHODS = (
     "logout",
     "control",
     "resize",
+    # Phase 13 update methods (D-10): manual check, skip/dismiss, auto toggle,
+    # and opening the release page in the default browser.
+    "check_for_update_now",
+    "skip_update_version",
+    "dismiss_update",
+    "set_auto_update",
+    "open_release_page",
 )
 
 
@@ -61,6 +68,7 @@ def serialize_state(
     auth_step: str = "login",
     theme: str | None = None,
     printer_name: str = "",
+    auto_update_enabled: bool = True,
 ) -> dict:
     """Turn PrintState + connection/auth status into the panel ``state`` object.
 
@@ -105,6 +113,10 @@ def serialize_state(
         # from PrintState -- no secret crosses the bridge (T-10-01). Present here
         # so it rides the initial pull and paints on first load (D-10).
         "version": __version__,
+        # Phase 13 (D-13): the auto-check toggle reflects the persisted
+        # auto_update_enabled, seeded here so the page toggle paints correctly on
+        # first load. Default True (toggle on) unless the provider says otherwise.
+        "autoUpdateEnabled": bool(auto_update_enabled),
     }
 
 
@@ -183,6 +195,31 @@ class Api:
         # Pure window-geometry hint from the page: resize the flyout to fit its
         # rendered content height (no secret, no printer interaction).
         return self._call("resize", height)
+
+    # --- Phase 13 update actions (page -> Python) ------------------------- #
+
+    def check_for_update_now(self):
+        # Manual "Controleer op updates" (UPD-08): forces a check; the handler
+        # pushes inline up-to-date feedback or the banner. Carries no secret.
+        return self._call("check_for_update_now")
+
+    def skip_update_version(self, version):
+        # "Deze versie overslaan" (UPD-07): persist skipped_version so it no
+        # longer notifies. Only a public version string crosses.
+        return self._call("skip_update_version", version)
+
+    def dismiss_update(self):
+        # "Later": the page hides the banner for the session; Python is a no-op.
+        return self._call("dismiss_update")
+
+    def set_auto_update(self, enabled):
+        # Auto-check on/off toggle (UPD-09): persist auto_update_enabled.
+        return self._call("set_auto_update", enabled)
+
+    def open_release_page(self, url):
+        # "Wat is er nieuw?" (UPD-05): open the GitHub release page in the default
+        # browser. The url originates from the trusted release html_url.
+        return self._call("open_release_page", url)
 
     # --- initial pull (Python -> page seed) ------------------------------- #
 

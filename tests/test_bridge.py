@@ -274,3 +274,81 @@ def test_bridge_module_does_not_import_webview():
 
     src = inspect.getsource(bridge_mod)
     assert "import webview" not in src
+
+
+# --------------------------------------------------------------------------- #
+# Phase 13-03: the five update Api methods + autoUpdateEnabled seed            #
+# --------------------------------------------------------------------------- #
+
+
+def test_api_check_for_update_now_forwards():
+    h = Mock()
+    api = Api(handlers={"check_for_update_now": h})
+    api.check_for_update_now()
+    h.assert_called_once_with()
+
+
+def test_api_skip_update_version_forwards():
+    h = Mock()
+    api = Api(handlers={"skip_update_version": h})
+    api.skip_update_version("2.3.0")
+    h.assert_called_once_with("2.3.0")
+
+
+def test_api_dismiss_update_forwards():
+    h = Mock()
+    api = Api(handlers={"dismiss_update": h})
+    api.dismiss_update()
+    h.assert_called_once_with()
+
+
+def test_api_set_auto_update_forwards():
+    h = Mock()
+    api = Api(handlers={"set_auto_update": h})
+    api.set_auto_update(False)
+    h.assert_called_once_with(False)
+
+
+def test_api_open_release_page_forwards():
+    h = Mock()
+    api = Api(handlers={"open_release_page": h})
+    api.open_release_page("https://x/rel")
+    h.assert_called_once_with("https://x/rel")
+
+
+def test_all_five_update_methods_in_methods_tuple():
+    from src.bridge import _METHODS
+
+    for name in (
+        "check_for_update_now",
+        "skip_update_version",
+        "dismiss_update",
+        "set_auto_update",
+        "open_release_page",
+    ):
+        assert name in _METHODS
+
+
+def test_update_methods_missing_handler_tolerated():
+    api = Api(handlers={})
+    # None of these should raise with no handler present.
+    api.check_for_update_now()
+    api.skip_update_version("1.0.0")
+    api.dismiss_update()
+    api.set_auto_update(True)
+    api.open_release_page("https://x")
+
+
+def test_serialize_state_emits_autoUpdateEnabled_default_true():
+    out = serialize_state(_running_state(), ConnectionStatus.CONNECTED, logged_in=True)
+    assert out["autoUpdateEnabled"] is True
+
+
+def test_serialize_state_autoUpdateEnabled_false_when_passed():
+    out = serialize_state(
+        _running_state(),
+        ConnectionStatus.CONNECTED,
+        logged_in=True,
+        auto_update_enabled=False,
+    )
+    assert out["autoUpdateEnabled"] is False
