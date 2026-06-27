@@ -252,6 +252,7 @@
        font-size:12px; color:var(--text-primary);">
     <div id="update-banner-text" style="margin-bottom:7px;">Nieuwe versie beschikbaar</div>
     <div style="display:flex; align-items:center; gap:12px;">
+      <span class="link" id="update-apply" style="font-size:12px; font-weight:700;">Nu bijwerken</span>
       <span class="link" id="update-whatsnew" style="font-size:12px; font-weight:600;">Wat is er nieuw?</span>
       <span style="flex:1;"></span>
       <span class="link-muted" id="update-later" style="font-size:12px;">Later</span>
@@ -785,6 +786,16 @@
     // control path is blocked by Bambu firmware, so the panel is read-only.)
 
     // Phase 13 update banner + auto-check controls (all guarded with hasApi()).
+    // Phase 14 (D-08): "Nu bijwerken" -> 1-click download + verify + silent
+    // install + relaunch. On success the app exits and the installer relaunches
+    // it, so this in-progress text only ever shows on the (rare) failure path
+    // before the red error banner replaces it.
+    $("update-apply").addEventListener("click", function () {
+      if (!hasApi()) { return; }
+      var t = $("update-banner-text");
+      if (t) { t.textContent = "Bezig met bijwerken…"; }
+      window.pywebview.api.apply_update();
+    });
     $("update-whatsnew").addEventListener("click", function () {
       if (hasApi() && current.updateUrl) { window.pywebview.api.open_release_page(current.updateUrl); }
     });
