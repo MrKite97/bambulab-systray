@@ -13,7 +13,7 @@
   run in a bare WebView2 browser, so none of that engine is reproduced here.
 
   The page is a PURE VIEW:
-    Python -> page : window.applyState / applyTheme / applyAuthStep / applyDevices / applyError
+    Python -> page : window.applyState / applyTheme / applyAuthStep / applyDevices / applyError / applyUpdate
     page -> Python : window.pywebview.api.{hide, get_initial_state, login_submit, submit_code,
                      resend_code, select_printer, logout, control}
 
@@ -241,6 +241,24 @@
 <body>
 <div class="flyout">
 
+  <!-- ===================== UPDATE BANNER (discrete, all screens) ============== -->
+  <!-- A DISCRETE (non-modal) top bar shown by window.applyUpdate when a newer
+       release is available (D-12). Muted/secondary styling (NOT the red error
+       banner). "Wat is er nieuw?" opens the release page; "Later" hides it for the
+       session; "Deze versie overslaan" persists a skip. NO apply/install button
+       (notify only this phase -- the 1-click apply path is Phase 14, D-14). -->
+  <div id="update-banner" style="display:none; margin-bottom:12px; padding:10px 12px;
+       border-radius:8px; background:var(--tile-bg); border:1px solid var(--btn-border);
+       font-size:12px; color:var(--text-primary);">
+    <div id="update-banner-text" style="margin-bottom:7px;">Nieuwe versie beschikbaar</div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <span class="link" id="update-whatsnew" style="font-size:12px; font-weight:600;">Wat is er nieuw?</span>
+      <span style="flex:1;"></span>
+      <span class="link-muted" id="update-later" style="font-size:12px;">Later</span>
+      <span class="link-muted" id="update-skip" style="font-size:12px;">Deze versie overslaan</span>
+    </div>
+  </div>
+
   <!-- ===================== B4. PROGRESS PANEL (logged in) ===================== -->
   <div class="screen" id="screen-progress">
     <!-- header -->
@@ -363,6 +381,22 @@
   <!-- shared error banner (below whichever screen is active) -->
   <div class="error-banner" id="error-banner"></div>
 
+  <!-- ===================== AUTO-CHECK TOGGLE + manual check (D-13) =========== -->
+  <!-- A single auto-check on/off toggle (bound to set_auto_update, seeded from
+       autoUpdateEnabled) plus a manual "Controleer op updates" trigger. The
+       inline "Je gebruikt de nieuwste versie" message (UPD-08) shows transiently
+       for an up-to-date manual check -- NO pop-up. -->
+  <div id="auto-update-row" style="margin-top:12px; display:flex; align-items:center;
+       justify-content:center; gap:8px; font-size:11.5px; color:var(--text-secondary);">
+    <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
+      <input type="checkbox" id="auto-update-toggle" />
+      <span>Automatisch op updates controleren</span>
+    </label>
+    <span class="link-muted" id="check-now" style="font-size:11.5px; cursor:pointer;">Controleer op updates</span>
+  </div>
+  <div id="update-uptodate" style="display:none; margin-top:7px; text-align:center;
+       font-size:11px; color:var(--text-secondary);">Je gebruikt de nieuwste versie</div>
+
   <!-- ===================== FOOTER (version, all screens) ===================== -->
   <!-- Lives inside .flyout but AFTER all screens, so it shows on every screen and
        is measured by syncHeight. Muted/small/bottom-anchored (D-09); applyState
@@ -393,7 +427,13 @@
     // navigation (a logged-out state, a real 2FA "code" step, or selecting a
     // printer). Without this, EITHER push path could snap the open settings view
     // back to the progress screen. null = nothing pinned (follow the normal rule).
-    pinnedScreen: null
+    pinnedScreen: null,
+    // Phase 13 update banner state: the available version + its release url, and
+    // the version the user hid via "Later" (session-only, stays hidden until a
+    // newer one arrives).
+    updateVersion: null,
+    updateUrl: null,
+    dismissedVersion: null
   };
 
   // Screens the user can deliberately PARK on while logged in (must survive any
@@ -511,6 +551,35 @@
     syncHeight();
   }
 
+  // Phase 13: Python -> page update notice (D-11/D-12). Two payload shapes share
+  // this channel:
+  //   { upToDate: true }                 -> inline "Je gebruikt de nieuwste versie"
+  //   { version, html_url }              -> the discrete banner
+  function applyUpdate(payload) {
+    payload = payload || {};
+    var banner = $("update-banner");
+    var upToDate = $("update-uptodate");
+    // Manual "up to date" inline feedback (UPD-08) -- NO pop-up, transient.
+    if (payload.upToDate) {
+      if (upToDate) {
+        upToDate.style.display = "block";
+        setTimeout(function () { upToDate.style.display = "none"; syncHeight(); }, 4000);
+      }
+      syncHeight();
+      return;
+    }
+    var version = payload.version;
+    if (!version) { return; }
+    current.updateVersion = version;
+    current.updateUrl = payload.html_url || null;
+    // "Later" hid this exact version for the session: stay hidden until a newer one.
+    if (current.dismissedVersion === version) { return; }
+    var txt = $("update-banner-text");
+    if (txt) { txt.textContent = "Nieuwe versie " + version + " beschikbaar"; }
+    if (banner) { banner.style.display = "block"; }
+    syncHeight();
+  }
+
   function applyDevices(list) {
     var container = $("printer-list");
     if (!container) { return; }
@@ -573,6 +642,13 @@
     if (state.version) {
       var vEl = document.getElementById("pp-version");
       if (vEl) { vEl.textContent = "v" + String(state.version).replace(/^v/i, ""); }
+    }
+
+    // Auto-check toggle (D-13): seed from autoUpdateEnabled. Guarded so a
+    // throttled live push that OMITS the key does not blank/flip the checkbox.
+    if (state.autoUpdateEnabled !== undefined && state.autoUpdateEnabled !== null) {
+      var autoEl = $("auto-update-toggle");
+      if (autoEl) { autoEl.checked = !!state.autoUpdateEnabled; }
     }
 
     current.loggedIn = !!state.loggedIn;
@@ -656,6 +732,7 @@
   window.applyAuthStep = applyAuthStep;
   window.applyDevices = applyDevices;
   window.applyError = applyError;
+  window.applyUpdate = applyUpdate;
 
   // -------------------------------------------------------------------------
   // page -> Python actions (window.pywebview.api.*), each guarded.
@@ -706,6 +783,28 @@
 
     // (control buttons removed -- no pause/resume/cancel wiring; the cloud
     // control path is blocked by Bambu firmware, so the panel is read-only.)
+
+    // Phase 13 update banner + auto-check controls (all guarded with hasApi()).
+    $("update-whatsnew").addEventListener("click", function () {
+      if (hasApi() && current.updateUrl) { window.pywebview.api.open_release_page(current.updateUrl); }
+    });
+    $("update-later").addEventListener("click", function () {
+      current.dismissedVersion = current.updateVersion;   // session-only hide
+      var b = $("update-banner"); if (b) { b.style.display = "none"; }
+      if (hasApi()) { window.pywebview.api.dismiss_update(); }
+      syncHeight();
+    });
+    $("update-skip").addEventListener("click", function () {
+      if (hasApi() && current.updateVersion) { window.pywebview.api.skip_update_version(current.updateVersion); }
+      var b = $("update-banner"); if (b) { b.style.display = "none"; }
+      syncHeight();
+    });
+    $("auto-update-toggle").addEventListener("change", function (e) {
+      if (hasApi()) { window.pywebview.api.set_auto_update(!!e.target.checked); }
+    });
+    $("check-now").addEventListener("click", function () {
+      if (hasApi()) { window.pywebview.api.check_for_update_now(); }
+    });
   }
 
   // -------------------------------------------------------------------------
