@@ -34,6 +34,53 @@ BUILD.md if a branded .ico is desired later.
 
 block_cipher = None
 
+# Make the project root importable from the spec's working dir so the SINGLE
+# version literal (src/version.py) is the source of the exe's file metadata too
+# -- no second hand-edited copy lives in this spec (D-06).
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath("."))
+
+from src.version import __version__, version_tuple
+from PyInstaller.utils.win32.versioninfo import (
+    VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+    StringStruct, VarFileInfo, VarStruct,
+)
+
+_vt = version_tuple()  # (2, 1, 0, 0) -- 4-int tuple derived from __version__
+
+# VSVersionInfo stamped onto the one-file exe so the Windows file-properties
+# "Details" tab shows the version sourced from version.py (D-07). v2.1 ships
+# UNSIGNED -- these strings are informational metadata, not a trust anchor.
+version_info = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=_vt,
+        prodvers=_vt,
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable(
+                "040904B0",  # US English, Unicode
+                [
+                    StringStruct("ProductName", "Bambu Lab Systray"),
+                    StringStruct("FileDescription", "Bambu Lab Systray — print monitor"),
+                    StringStruct("ProductVersion", __version__),
+                    StringStruct("FileVersion", __version__),
+                    StringStruct("CompanyName", "Maarten Vlieger"),
+                    StringStruct("OriginalFilename", "bambulab-systray.exe"),
+                ],
+            )
+        ]),
+        VarFileInfo([VarStruct("Translation", [0x0409, 0x04B0])]),
+    ],
+)
+
 
 a = Analysis(
     ['run_app.py'],
@@ -88,4 +135,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=None,
+    version=version_info,  # stamp VSVersionInfo (from src/version.py) onto the exe
 )
