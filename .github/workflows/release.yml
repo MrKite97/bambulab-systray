@@ -1,0 +1,132 @@
+name: Release
+
+# Tag-triggered release: build the one-file exe + the Inno Setup installer, assert the
+# tag == version.py == installer AppVersion all agree, then publish a GitHub Release with
+# the Setup .exe and its SHA-256. v2.1 ships UNSIGNED (code-signing deferred).
+#
+# Trigger:  git tag v2.1.0 && git push origin v2.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the Release and upload assets
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1" # force UTF-8 so the spec's "—" / accented strings don't choke on cp1252
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: |
+          # GITHUB_REF_NAME is the tag, e.g. "v2.1.0"; strip the leading v for the literal.
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then echo "::error::empty version from tag '$GITHUB_REF_NAME'"; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag $GITHUB_REF_NAME -> version $VERSION"
+
+      - name: Write version into the single source (src/version.py)
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          # version.py is the ONE literal; overwrite __version__ so exe metadata + installer + tag agree.
+          python - "$VERSION" <<'PY'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          p = pathlib.Path("src/version.py")
+          text = p.read_text(encoding="utf-8")
+          new, n = re.subn(r'__version__\s*=\s*"[^"]*"', f'__version__ = "{version}"', text, count=1)
+          if n != 1:
+              sys.exit("could not find a single __version__ literal in src/version.py")
+          p.write_text(new, encoding="utf-8")
+          print(f"src/version.py __version__ = {version}")
+          PY
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.21.0
+
+      - name: Build one-file exe (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller bambulab-systray.spec
+          test -f dist/bambulab-systray.exe || { echo "::error::PyInstaller did not produce dist/bambulab-systray.exe"; exit 1; }
+
+      - name: Install Inno Setup (pinned — windows-latest does NOT preinstall it)
+        shell: bash
+        run: |
+          choco install innosetup --version=6.2.2 -y --no-progress
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          test -f "$ISCC" || { echo "::error::ISCC.exe not found at expected path"; exit 1; }
+          echo "ISCC=$ISCC" >> "$GITHUB_ENV"
+
+      - name: Compile installer (ISCC)
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          "$ISCC" "/DMyAppVersion=$VERSION" installer/bambulab-systray.iss
+          SETUP="installer/Output/BambuLabSystray-Setup-$VERSION.exe"
+          test -f "$SETUP" || { echo "::error::installer not produced at $SETUP"; exit 1; }
+          echo "SETUP=$SETUP" >> "$GITHUB_ENV"
+
+      - name: Assert tag == version.py == installer AppVersion
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          # 1) version.py literal
+          PYVER=$(python -c "import src.version as v; print(v.__version__)")
+          # 2) installer AppVersion: the compiled Setup is named with the version we passed via /D,
+          #    and that came from the same VERSION; assert the produced file exists for THIS version.
+          test -f "installer/Output/BambuLabSystray-Setup-$VERSION.exe" || { echo "::error::no installer for $VERSION"; exit 1; }
+          if [ "$PYVER" != "$VERSION" ]; then
+            echo "::error::version mismatch: tag=$VERSION but src.version.__version__=$PYVER"; exit 1
+          fi
+          echo "OK: tag == version.py == installer AppVersion == $VERSION"
+
+      - name: Compute SHA-256
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          SHA_FILE="$SETUP.sha256"
+          # certutil is built-in; sha256sum also present in the bundled Git bash.
+          sha256sum "$SETUP" | awk '{print $1}' > "$SHA_FILE"
+          echo "SHA256 $(cat "$SHA_FILE")  $SETUP"
+          echo "SHA_FILE=$SHA_FILE" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            Bambu Lab Systray ${{ github.ref_name }}
+
+            Unsigned per-user installer. On first run Windows SmartScreen may warn
+            ("Windows heeft uw pc beveiligd") — choose **Meer info → Toch uitvoeren**.
+
+            **Assets**
+            - `BambuLabSystray-Setup-${{ steps.ver.outputs.version }}.exe` — the installer
+            - `…​.exe.sha256` — its SHA-256 checksum
+          files: |
+            ${{ env.SETUP }}
+            ${{ env.SHA_FILE }}

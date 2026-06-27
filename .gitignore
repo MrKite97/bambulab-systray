@@ -10,3 +10,15 @@ __pycache__/
 dist/
 build/
 *.exe
+
+# Installer output (the .iss is checked in; compiled Setup is not)
+installer/Output/
+
+# Secrets / local env — NEVER commit credentials, tokens, or runtime logs
+.env
+.env.*
+*.log
+*.pem
+*.key
+credentials.json
+*-credentials.json
