@@ -386,8 +386,10 @@
   <!-- A single auto-check on/off toggle (bound to set_auto_update, seeded from
        autoUpdateEnabled) plus a manual "Controleer op updates" trigger. The
        inline "Je gebruikt de nieuwste versie" message (UPD-08) shows transiently
-       for an up-to-date manual check -- NO pop-up. -->
-  <div id="auto-update-row" style="margin-top:12px; display:flex; align-items:center;
+       for an up-to-date manual check -- NO pop-up.
+       Hidden by default so it does NOT clutter the print-overview screen --
+       revealed on demand by clicking the version footer below. -->
+  <div id="auto-update-row" style="margin-top:12px; display:none; align-items:center;
        justify-content:center; gap:8px; font-size:11.5px; color:var(--text-secondary);">
     <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
       <input type="checkbox" id="auto-update-toggle" />
@@ -401,11 +403,13 @@
   <!-- ===================== FOOTER (version, all screens) ===================== -->
   <!-- Lives inside .flyout but AFTER all screens, so it shows on every screen and
        is measured by syncHeight. Muted/small/bottom-anchored (D-09); applyState
-       overwrites the text from state.version (the single source still wins). -->
+       overwrites the text from state.version (the single source still wins).
+       Clicking the version reveals/hides the update-settings row above (so the
+       toggle + manual check stay reachable without sitting on the overview). -->
   <div id="pp-version-footer"
        style="margin-top:14px; text-align:center; font-size:11px;
               color:var(--text-secondary); user-select:none;">
-    <span id="pp-version">v2.1.0</span>
+    <span id="pp-version" style="cursor:pointer;" title="Klik voor update-instellingen">v2.1.0</span>
   </div>
 
 </div>
@@ -815,6 +819,16 @@
     });
     $("check-now").addEventListener("click", function () {
       if (hasApi()) { window.pywebview.api.check_for_update_now(); }
+    });
+    // Clicking the version footer reveals/hides the update-settings row, keeping
+    // the toggle + manual check off the print-overview screen by default.
+    $("pp-version").addEventListener("click", function () {
+      var row = $("auto-update-row");
+      if (!row) { return; }
+      var showing = row.style.display !== "none";
+      row.style.display = showing ? "none" : "flex";
+      if (showing) { var u = $("update-uptodate"); if (u) { u.style.display = "none"; } }
+      syncHeight();
     });
   }
 
