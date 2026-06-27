@@ -377,39 +377,42 @@
     <div style="margin-top:13px; display:flex; align-items:center; justify-content:center;">
       <span class="link-muted" id="btn-logout" style="font-size:12px;">Uitloggen</span>
     </div>
+
+    <!-- ============= Updates (D-13): auto-check toggle + manual check =========
+         Lives on the settings screen (this screen, reached via the gear) so it
+         stays OFF the print-overview. auto-check toggle is bound to
+         set_auto_update + seeded from autoUpdateEnabled; "Controleer op updates"
+         is the manual check; the inline up-to-date message (UPD-08) shows
+         transiently for an up-to-date manual check -- NO pop-up. -->
+    <div style="margin-top:16px; padding-top:13px;
+                border-top:1px solid var(--divider, rgba(127,127,127,0.18));">
+      <div style="font-size:12px; font-weight:600; color:var(--text-primary); margin-bottom:9px;">Updates</div>
+      <div id="auto-update-row" style="display:flex; align-items:center; justify-content:space-between;
+           gap:8px; font-size:11.5px; color:var(--text-secondary);">
+        <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
+          <input type="checkbox" id="auto-update-toggle" />
+          <span>Automatisch op updates controleren</span>
+        </label>
+        <span class="link-muted" id="check-now" style="font-size:11.5px; cursor:pointer; white-space:nowrap;">Controleer op updates</span>
+      </div>
+      <div id="update-uptodate" style="display:none; margin-top:7px; font-size:11px;
+           color:var(--text-secondary);">Je gebruikt de nieuwste versie</div>
+    </div>
   </div>
 
   <!-- shared error banner (below whichever screen is active) -->
   <div class="error-banner" id="error-banner"></div>
 
-  <!-- ===================== AUTO-CHECK TOGGLE + manual check (D-13) =========== -->
-  <!-- A single auto-check on/off toggle (bound to set_auto_update, seeded from
-       autoUpdateEnabled) plus a manual "Controleer op updates" trigger. The
-       inline "Je gebruikt de nieuwste versie" message (UPD-08) shows transiently
-       for an up-to-date manual check -- NO pop-up.
-       Hidden by default so it does NOT clutter the print-overview screen --
-       revealed on demand by clicking the version footer below. -->
-  <div id="auto-update-row" style="margin-top:12px; display:none; align-items:center;
-       justify-content:center; gap:8px; font-size:11.5px; color:var(--text-secondary);">
-    <label style="display:flex; align-items:center; gap:7px; cursor:pointer;">
-      <input type="checkbox" id="auto-update-toggle" />
-      <span>Automatisch op updates controleren</span>
-    </label>
-    <span class="link-muted" id="check-now" style="font-size:11.5px; cursor:pointer;">Controleer op updates</span>
-  </div>
-  <div id="update-uptodate" style="display:none; margin-top:7px; text-align:center;
-       font-size:11px; color:var(--text-secondary);">Je gebruikt de nieuwste versie</div>
-
   <!-- ===================== FOOTER (version, all screens) ===================== -->
   <!-- Lives inside .flyout but AFTER all screens, so it shows on every screen and
        is measured by syncHeight. Muted/small/bottom-anchored (D-09); applyState
        overwrites the text from state.version (the single source still wins).
-       Clicking the version reveals/hides the update-settings row above (so the
-       toggle + manual check stay reachable without sitting on the overview). -->
+       The update toggle + manual check live on the settings screen (screen-select)
+       instead of here, so they stay off the print overview. -->
   <div id="pp-version-footer"
        style="margin-top:14px; text-align:center; font-size:11px;
               color:var(--text-secondary); user-select:none;">
-    <span id="pp-version" style="cursor:pointer;" title="Klik voor update-instellingen">v2.1.0</span>
+    <span id="pp-version">v2.1.0</span>
   </div>
 
 </div>
@@ -819,16 +822,6 @@
     });
     $("check-now").addEventListener("click", function () {
       if (hasApi()) { window.pywebview.api.check_for_update_now(); }
-    });
-    // Clicking the version footer reveals/hides the update-settings row, keeping
-    // the toggle + manual check off the print-overview screen by default.
-    $("pp-version").addEventListener("click", function () {
-      var row = $("auto-update-row");
-      if (!row) { return; }
-      var showing = row.style.display !== "none";
-      row.style.display = showing ? "none" : "flex";
-      if (showing) { var u = $("update-uptodate"); if (u) { u.style.display = "none"; } }
-      syncHeight();
     });
   }
 
