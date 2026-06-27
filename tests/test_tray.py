@@ -27,6 +27,10 @@ class FakeIcon:
         self.visible = False
         self.icon_set_count = 0
         self.title_set_count = 0
+        self.notifications = []
+
+    def notify(self, message, title=None):
+        self.notifications.append((message, title))
 
     def __setattr__(self, k, v):
         object.__setattr__(self, k, v)
@@ -507,3 +511,88 @@ def test_reset_to_logged_out_clears_state_and_shows_neutral():
     # reset enqueues a repaint; the UI pump applies it on its thread
     ctrl.pump_once()
     assert icon.title == status.TOOLTIP_CLOUD_DISCONNECTED
+
+
+# --- Phase 13-02: update-balloon (enqueue-only, UI-thread drain) -------------
+#
+# The update balloon rides its OWN queue (separate from the render-request queue)
+# so it is never collapsed into the render debounce key. signal_update_available
+# is enqueue-only from the daemon thread; only pump_once calls icon.notify on the
+# UI thread. CRITICAL regression guard: a balloon enqueued on a tick with NO
+# pending render request (the COMMON case) must STILL fire exactly one notify --
+# it must be drained BEFORE pump_once's `if latest is None: return` render
+# early-out.
+
+
+def test_signal_update_available_does_not_notify_off_thread():
+    """signal_update_available from a non-UI thread enqueues only -- it must NOT
+    call icon.notify before pump_once."""
+    icon = FakeIcon()
+    ctrl = tray.TrayController(icon, _active(42, 83))
+
+    t = threading.Thread(
+        target=ctrl.signal_update_available, args=("2.2.0", "https://x/rel")
+    )
+    t.start()
+    t.join()
+
+    assert icon.notifications == []
+
+
+def test_pump_once_drains_balloon_and_notifies_once():
+    """pump_once drains a queued balloon and calls icon.notify exactly once on the
+    UI thread, with a message mentioning the new version."""
+    icon = FakeIcon()
+    ctrl = _connected(icon, _active(42, 83))
+
+    ctrl.signal_update_available("2.2.0", "https://x/rel")
+    ctrl.pump_once()
+
+    assert len(icon.notifications) == 1
+    message, _title = icon.notifications[0]
+    assert "2.2.0" in message
+
+
+def test_balloon_with_no_pending_render_still_fires_once():
+    """REGRESSION (early-return-swallow): a balloon enqueued while the render queue
+    is EMPTY (the common case -- print state unchanged) must STILL fire exactly one
+    notify. This guards against the balloon being placed below pump_once's
+    `if latest is None: return` render early-out."""
+    icon = FakeIcon()
+    ctrl = _connected(icon, _active(42, 83))
+
+    # No on_state_change() -> render queue is empty. Only a balloon is queued.
+    ctrl.signal_update_available("2.3.0", "https://x/rel2")
+    ctrl.pump_once()
+
+    assert len(icon.notifications) == 1
+    assert "2.3.0" in icon.notifications[0][0]
+    # And the render queue being empty means no repaint happened.
+    assert icon.icon_set_count == 0
+
+
+def test_balloon_and_render_in_same_pump_both_apply():
+    """A queued balloon AND a queued render request in the same pump cycle both
+    apply: the render repaints AND the balloon fires exactly one notify (the
+    balloon is not swallowed by the render debounce)."""
+    icon = FakeIcon()
+    ctrl = _connected(icon, _active(42, 83))
+
+    ctrl.on_state_change()  # render request queued
+    ctrl.signal_update_available("2.2.0", "https://x/rel")  # balloon queued
+    ctrl.pump_once()
+
+    assert icon.icon_set_count == 1  # render applied
+    assert len(icon.notifications) == 1  # balloon fired
+    assert "2.2.0" in icon.notifications[0][0]
+
+
+def test_no_balloon_queued_pump_never_notifies():
+    """With no balloon queued, pump_once never calls icon.notify."""
+    icon = FakeIcon()
+    ctrl = _connected(icon, _active(42, 83))
+
+    ctrl.on_state_change()
+    ctrl.pump_once()
+
+    assert icon.notifications == []

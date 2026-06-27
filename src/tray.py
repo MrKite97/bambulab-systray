@@ -25,6 +25,14 @@ LOCKED RULES (02-CONTEXT.md "Behavior & Threading" + "Redraw policy"):
    connection status + an injectable monotonic clock) and paints through the same
    single marshalling seam as print updates (REL-02/REL-03/STAT-05, T-03-04).
 
+4. UPDATE BALLOON (Phase 13, D-09) -- the daemon update-check thread signals an
+   available update via :meth:`signal_update_available`, ANOTHER enqueue-only
+   signal (its own queue) drained on the UI thread (same discipline as connection
+   status -- the daemon NEVER calls ``icon.notify``). It is drained in
+   :meth:`pump_once` BEFORE the render early-out, so a balloon fires even when no
+   repaint is pending. This module logs nothing, so a notify hiccup is swallowed
+   silently (bare ``pass``), never via a logger.
+
 This module forwards only ``render.*`` output, which reads non-secret PrintState
 fields and a ``ConnectionStatus`` enum; it references no token and logs nothing
 (T-02-05 / T-03-05).
@@ -72,6 +80,10 @@ class TrayController:
         self._icon = icon  # pystray Icon (or a FakeIcon in tests)
         self._state = state  # shared PrintState (single source of truth)
         self._requests = queue.Queue()  # network -> UI render requests
+        # Update-balloon requests (version, url), its OWN queue so a balloon is
+        # never collapsed into the render-request debounce key. Enqueued off-thread
+        # by signal_update_available, drained by pump_once on the UI thread.
+        self._balloons = queue.Queue()
         self._last_key = object()  # sentinel: nothing applied yet
         # Injectable monotonic clock (tests pass a fake so freshness needs no real
         # waits). Defaults to time.monotonic so existing callers keep working.
@@ -129,17 +141,50 @@ class TrayController:
         NEVER touches the icon (no ``.icon`` / ``.title`` assignment here)."""
         self._requests.put(self._key())
 
+    def signal_update_available(self, version, url):
+        """Call from the NETWORK/daemon thread (Phase 13, D-09). Enqueues a
+        tray-balloon request (version, url) onto its OWN queue; it NEVER calls
+        ``icon.notify`` -- the balloon, like a render request, is drained on the
+        UI thread inside :meth:`pump_once`. This preserves the locked cross-thread
+        STA boundary (the daemon never touches the icon)."""
+        self._balloons.put((version, url))
+
     def pump_once(self):
-        """Call from the UI thread. Drains all pending requests (coalescing to
-        the latest) and repaints AT MOST once -- only if the displayed value
-        changed versus the last applied key."""
+        """Call from the UI thread. Drains the update-balloon queue AND the
+        render-request queue, then repaints AT MOST once (debounced).
+
+        The balloon drain runs FIRST and is INDEPENDENT of the render-request
+        queue: a balloon enqueued on a tick with NO pending render request (the
+        COMMON case -- the daemon enqueues a balloon while print state is
+        unchanged, so the render queue is empty) must STILL fire. So it is drained
+        BEFORE the `if latest is None: return` render early-out below, which only
+        short-circuits the REPAINT, never the balloon."""
+        # 1) Balloon drain -- independent of the render queue, fires even when no
+        #    repaint is pending.
+        balloon = None
+        try:
+            while True:
+                balloon = self._balloons.get_nowait()
+        except queue.Empty:
+            pass
+        if balloon is not None:
+            version, _url = balloon
+            try:
+                self._icon.notify(
+                    f"Versie {version} is beschikbaar", "Bambu Lab systray"
+                )
+            except Exception:  # noqa: BLE001 - a notify hiccup must never break the pump
+                pass
+
+        # 2) Render-request drain/apply -- its early-out short-circuits ONLY the
+        #    repaint, NOT the balloon drain above.
         latest = None
         try:
             while True:
                 latest = self._requests.get_nowait()
         except queue.Empty:
             pass
-        if latest is None:  # queue was empty -- nothing to do
+        if latest is None:  # queue was empty -- nothing to repaint
             return
         if latest == self._last_key:  # displayed value unchanged -- debounce
             return
