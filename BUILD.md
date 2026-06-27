@@ -1,7 +1,11 @@
 # Building Bambu Lab Systray
 
-This produces a single, console-less, portable `bambulab-systray.exe` that a user
-can drop in place and run. No installer, no admin rights, no auto-update.
+This produces a single, console-less `bambulab-systray.exe`. That exe is the input
+to the **Inno Setup installer** (`installer/bambulab-systray.iss`) and the
+**tag-driven GitHub release** that publishes the per-user Setup `.exe` + its
+SHA-256 (see "Releases" below). The packaged app also **self-updates** from those
+releases. The exe still runs standalone (double-click `dist\bambulab-systray.exe`)
+if you just want the portable form.
 
 ## Prerequisites
 
@@ -140,9 +144,47 @@ Do this on a fresh machine or a fresh user profile (no `.venv`, no prior run):
 Record the build result, the `reg query` output, and any AV flag in
 `.planning/phases/04-persistence-autostart-packaging/04-03-SUMMARY.md`.
 
+## Installer (Inno Setup)
+
+The per-user installer is defined by **`installer/bambulab-systray.iss`** (Phase 11).
+It installs to `%LOCALAPPDATA%\Programs\Bambu Lab Systray` with
+`PrivilegesRequired=lowest` (no UAC), adds a Start-menu shortcut, offers a
+default-checked "met Windows opstarten" task that writes the **same** `HKCU\Run`
+value (`BambuLabSystray`) the in-app toggle owns, and supports the silent
+self-update flags with `AppMutex=Global\BambuLabSystray_singleton`. Compile it
+locally with the Inno Setup Compiler:
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=2.1.0 installer\bambulab-systray.iss
+# -> installer\Output\BambuLabSystray-Setup-2.1.0.exe
+```
+
+`MyAppVersion` defaults to the value in the `.iss` if `/D` is omitted, but CI
+always passes it from the git tag so the tag, `src/version.py`, and the installer
+AppVersion stay in lockstep.
+
+## Releases (tag-driven CI)
+
+Pushing a `v*` tag triggers **`.github/workflows/release.yml`** (Phase 12) on
+`windows-latest`:
+
+1. Derive the version from the tag (strip the leading `v`) and write it into
+   `src/version.py` — the single source of truth (Phase 10).
+2. `pyinstaller bambulab-systray.spec` → `dist\bambulab-systray.exe`.
+3. Install a **pinned Inno Setup** (windows-latest does not preinstall it) and run
+   `ISCC /DMyAppVersion=<version>` on the `.iss`.
+4. **Assert** the tag == `src.version.__version__` == installer AppVersion (the
+   build fails on any mismatch).
+5. Compute the SHA-256 and publish a **GitHub Release** with the Setup `.exe` +
+   its `.sha256`.
+
+The one-time **go-public** steps (create the remote, the clean-history secret
+audit, flip the repo public, push the first tag) are documented in
+`.planning/phases/12-go-public-ci-release/12-DEFERRED-STEPS.md`.
+
 ## Out of scope
 
-- **No installer / MSI** — the deliverable is a single portable `.exe`.
-- **No auto-update** mechanism.
 - **Code signing certificate procurement** is the user's call (documented above
-  as the primary AV mitigation, but not performed by the build).
+  as the primary AV mitigation and as the way to remove the SmartScreen
+  "unknown publisher" wall). v2.1 ships **unsigned**; the README documents the
+  SmartScreen "Meer info → Toch uitvoeren" path for first-time users.
