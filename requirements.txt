@@ -4,6 +4,7 @@ requests>=2.32
 pystray==0.19.5
 Pillow==12.2.0
 pywebview==6.2.1
+packaging>=24.0
 
 # build/dev only
 pyinstaller==6.21.0
