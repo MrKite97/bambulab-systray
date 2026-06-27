@@ -1204,6 +1204,64 @@ def test_build_app_wires_flyout_bridge_and_toggle(monkeypatch):
     assert "loggedIn" in initial and "theme" in initial
 
 
+def test_build_app_apply_update_routes_to_make_update_apply(monkeypatch):
+    """build_gui wires Api.apply_update -> make_update_apply: with an actionable
+    UpdateInfo stashed and fake download/spawn, calling api.apply_update() records
+    download -> spawn -> teardown order (no real network/process)."""
+    order = []
+    monkeypatch.setattr(app, "download_installer", lambda info: order.append("download") or "C:/Setup.exe")
+    monkeypatch.setattr(app, "spawn_installer", lambda path: order.append("spawn"))
+    _patch_build_app(monkeypatch)
+
+    result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
+
+    # Stash an actionable UpdateInfo where get_update_info reads it (simulating the
+    # update-check loop firing on_update).
+    result["on_update"]("the-update-info")
+    result["api"].apply_update()
+
+    assert order == ["download", "spawn"]
+    # Teardown ran via the shared sequence: the icon was stopped (app exits).
+    assert result["icon"].stop_count == 1
+    assert result["shutdown_event"].is_set()
+
+
+def test_run_update_check_calls_on_update_with_actionable_info(monkeypatch):
+    """run_update_check fires the on_update setter with the actionable UpdateInfo
+    so 'Nu bijwerken' sees the LIVE info to download."""
+    from src.updater import UpdateInfo
+
+    info = UpdateInfo(
+        version="2.2.0", tag="v2.2.0", html_url="https://x/v2.2.0",
+        asset_name="Setup.exe", asset_url="https://x/Setup.exe",
+        asset_size=10, sha256_url="https://x/Setup.exe.sha256", etag=None,
+    )
+
+    class _Prefs:
+        def load_update_prefs(self):
+            return {"auto_update_enabled": True}
+
+        def save_update_prefs(self, prefs):
+            pass
+
+    captured = {}
+    controller = FakeController()
+
+    class _Flyout:
+        def push_update(self, payload):
+            pass
+
+    app.run_update_check(
+        controller,
+        _Flyout(),
+        check=lambda current, etag: info,
+        prefs_module=_Prefs(),
+        on_update=lambda i: captured.__setitem__("info", i),
+    )
+
+    assert captured.get("info") is info
+
+
 def test_build_app_creates_one_hidden_flyout_window(monkeypatch):
     """build_app creates exactly ONE hidden frameless window via webview."""
     captured = _patch_build_app(monkeypatch)
@@ -1317,6 +1375,7 @@ def _fake_gui(*, icon, flyout, session, controller=None):
         "start_mqtt": (lambda token, serial: None),
         "stop_session": (lambda: None),
         "relogin_handler": object(),
+        "on_update": (lambda info: None),
     }
 
 

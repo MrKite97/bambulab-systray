@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from src import bridge
 from src.bridge import Api, serialize_state
 from src.state import PrintState
 from src.status import ConnectionStatus
@@ -251,6 +252,19 @@ def test_api_get_initial_state_accepts_prebuilt_dict_provider():
     out = api.get_initial_state()
     assert out["loggedIn"] is True
     assert out["status"] == "paused"
+
+
+def test_api_apply_update_calls_handler_once():
+    # "Nu bijwerken" (UPD-06): the Api method dispatches to the wired handler.
+    fn = Mock()
+    api = Api(handlers={"apply_update": fn})
+    api.apply_update()
+    fn.assert_called_once_with()
+
+
+def test_apply_update_registered_in_methods():
+    assert "apply_update" in bridge._METHODS
+    assert hasattr(Api(), "apply_update")
 
 
 def test_api_handlers_object_attribute_style():

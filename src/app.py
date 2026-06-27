@@ -568,6 +568,7 @@ def run_update_check(
     prefs_module=update_prefs_module,
     current=None,
     force=False,
+    on_update=None,
 ):
     """One update-check pass (D-08). Never raises.
 
@@ -578,6 +579,11 @@ def run_update_check(
     version (``info.version != last_notified_version``). Returns the UpdateInfo
     found (or None) so the manual bridge handler can give inline 'up to date'
     feedback. No secret is logged here -- only public version/url values.
+
+    ``on_update`` (Phase 14, D-08) is an optional callback invoked with the
+    actionable ``UpdateInfo`` (newer, non-skipped) so 'Nu bijwerken' can read the
+    LIVE info to download. It defaults to None so main()'s existing call is
+    unaffected; build_gui wires it to stash the latest info for make_update_apply.
     """
     prefs = prefs_module.load_update_prefs()
     if not force and not prefs.get("auto_update_enabled", True):
@@ -593,6 +599,13 @@ def run_update_check(
     if info.version == prefs.get("skipped_version"):
         prefs_module.save_update_prefs(prefs)  # skipped: persist last_check/etag, no notify
         return info
+    # Stash the actionable info so 'Nu bijwerken' (make_update_apply) can read the
+    # LIVE UpdateInfo to download (D-08). Best-effort; never crash the check.
+    if on_update is not None:
+        try:
+            on_update(info)
+        except Exception:  # noqa: BLE001 - holder set must never crash the check
+            logger.debug("on_update(info) raised; continuing")
     # Banner ALWAYS (best-effort, fire-and-forget).
     try:
         flyout.push_update({"version": info.version, "html_url": info.html_url})
@@ -618,6 +631,7 @@ def make_update_check(
     startup_delay=UPDATE_CHECK_STARTUP_DELAY_SECONDS,
     check=check_for_update,
     prefs_module=update_prefs_module,
+    on_update=None,
 ):
     """Build the zero-arg target for the daemon 'update-check' thread (D-07).
 
@@ -625,7 +639,11 @@ def make_update_check(
     runs a check and loops every ``interval`` -- each ``wait`` returning True means
     shutdown was requested, so it breaks. Each pass is guarded so one failure never
     kills the thread (the check itself already soft-fails to None; this guards the
-    rest)."""
+    rest).
+
+    ``on_update`` (Phase 14, D-08) is forwarded to each ``run_update_check`` pass so
+    the latest actionable UpdateInfo is stashed for 'Nu bijwerken'. Defaults to None
+    (main()'s call is unaffected)."""
 
     def _loop():
         if shutdown_event.wait(timeout=startup_delay):
@@ -633,7 +651,11 @@ def make_update_check(
         while True:
             try:
                 run_update_check(
-                    controller, flyout, check=check, prefs_module=prefs_module
+                    controller,
+                    flyout,
+                    check=check,
+                    prefs_module=prefs_module,
+                    on_update=on_update,
                 )
             except Exception:  # noqa: BLE001 - one bad pass must not kill the daemon
                 logger.debug("update-check pass raised; continuing", exc_info=False)
@@ -826,7 +848,9 @@ def make_session(
     return SessionController(**kwargs)
 
 
-def make_bridge_handlers(flyout, session, *, start_mqtt=None, get_controller=None):
+def make_bridge_handlers(
+    flyout, session, *, start_mqtt=None, get_controller=None, apply_update=None
+):
     """Build the js_api handler mapping wiring the panel to the SessionController.
 
     ``hide`` stays the real ``flyout.hide`` (click-away / tray toggle); the five
@@ -857,6 +881,11 @@ def make_bridge_handlers(flyout, session, *, start_mqtt=None, get_controller=Non
     # call time (the controller does not exist when these handlers are built).
     if get_controller is not None:
         handlers.update(make_update_handlers(get_controller, flyout))
+    # Phase 14 (D-08): the 'Nu bijwerken' handler is built AFTER the icon exists,
+    # so build_gui passes a late-bind accessor (``apply_update``) here; when None
+    # (the bare call) the handler is a safe no-op until a session/icon exists.
+    if apply_update is not None:
+        handlers["apply_update"] = apply_update
     for name in _STUB_ACTIONS:
         handlers[name] = _make_stub_action(name)
     return handlers
@@ -1182,6 +1211,12 @@ def build_gui(
     # The Api's state_provider needs the controller (built after the icon); a
     # late-bound holder fills it in once the controller exists.
     _holder = {"controller": None}
+    # Phase 14 (D-08): the LATEST actionable UpdateInfo (stashed by the update-check
+    # loop) read by 'Nu bijwerken'; and the apply handler itself, built AFTER the
+    # icon exists and filled in below. Both late-bound so the bridge can route
+    # "apply_update" before the icon/controller are constructed.
+    _update_holder = {"info": None}  # latest actionable UpdateInfo
+    _apply_holder = {"fn": None}  # make_update_apply callback (filled after icon)
 
     def _state_provider():
         # The page seed (get_initial_state) opens LOGGED-OUT on start; the
@@ -1243,6 +1278,14 @@ def build_gui(
         settings=settings,
     )
 
+    def _apply_update_router(*_args, **_kwargs):
+        # Route "apply_update" to the late-built handler; no-op-safe until it is
+        # filled in after the icon exists (so the page can never crash the bridge).
+        fn = _apply_holder["fn"]
+        if fn is None:
+            return None
+        return fn()
+
     api = bridge.Api(
         handlers=make_bridge_handlers(
             flyout,
@@ -1251,6 +1294,9 @@ def build_gui(
             # Late-bind accessor: check_for_update_now resolves the controller at
             # call time (it is filled into _holder after the TrayController exists).
             get_controller=lambda: _holder["controller"],
+            # Phase 14 (D-08): "Nu bijwerken" routes through the no-op-safe late
+            # router; the real make_update_apply callback is filled below.
+            apply_update=_apply_update_router,
         ),
         state_provider=_state_provider,
     )
@@ -1318,6 +1364,26 @@ def build_gui(
     # controller for the on_message/on_connect wrappers + 401 status).
     start_mqtt.controller = controller
 
+    # Phase 14 (D-06/D-08): now that the icon exists, build 'Nu bijwerken'. It
+    # downloads + verifies the installer, spawns it detached on success, then runs
+    # the EXACT locked quit order (via the shared _run_quit_sequence) so the app
+    # exits and the installer swaps the exe. The client is the lazy proxy (the live
+    # MQTT client is built later by start_mqtt); get_update_info reads the latest
+    # actionable UpdateInfo the update-check loop stashed.
+    # Reference download/spawn by their CURRENT module-level binding (resolved here
+    # at build time) rather than make_update_apply's import-time defaults, so the
+    # tests can monkeypatch app.download_installer / app.spawn_installer to drive
+    # the apply path with fakes (no real network / process).
+    _apply_holder["fn"] = make_update_apply(
+        icon,
+        _LazyClientProxy(start_mqtt),
+        shutdown_event,
+        flyout,
+        get_update_info=lambda: _update_holder["info"],
+        download=download_installer,
+        spawn=spawn_installer,
+    )
+
     return {
         "icon": icon,
         "controller": controller,
@@ -1330,6 +1396,9 @@ def build_gui(
         "start_mqtt": start_mqtt,
         "stop_session": stop_session,
         "relogin_handler": relogin_handler,
+        # Phase 14 (D-08): the setter the update-check loop calls so the latest
+        # actionable UpdateInfo is stashed where 'Nu bijwerken' reads it.
+        "on_update": lambda info: _update_holder.__setitem__("info", info),
     }
 
 
@@ -1458,6 +1527,7 @@ def build_app(
         "start_mqtt": gui["start_mqtt"],
         "stop_session": gui["stop_session"],
         "relogin_handler": relogin_handler,
+        "on_update": gui["on_update"],
     }
 
 
@@ -1577,7 +1647,14 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     # one-time balloon (drained by the tray pump on the UI thread) and pushes the
     # panel banner -- never touching the icon off-thread.
     threading.Thread(
-        target=make_update_check(controller, flyout, shutdown_event),
+        target=make_update_check(
+            controller,
+            flyout,
+            shutdown_event,
+            # Phase 14 (D-08): stash the latest actionable UpdateInfo so the panel's
+            # "Nu bijwerken" button downloads the LIVE release the banner announced.
+            on_update=gui["on_update"],
+        ),
         name="update-check",
         daemon=True,
     ).start()

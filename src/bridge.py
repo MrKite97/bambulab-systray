@@ -44,6 +44,8 @@ _METHODS = (
     "dismiss_update",
     "set_auto_update",
     "open_release_page",
+    # Phase 14 (D-08): 1-click apply -- download + verify + silent install + relaunch.
+    "apply_update",
 )
 
 
@@ -220,6 +222,11 @@ class Api:
         # "Wat is er nieuw?" (UPD-05): open the GitHub release page in the default
         # browser. The url originates from the trusted release html_url.
         return self._call("open_release_page", url)
+
+    def apply_update(self):
+        # "Nu bijwerken" (UPD-06): download + SHA-256-verify the installer, then
+        # spawn it detached and run the locked quit order. Carries no secret.
+        return self._call("apply_update")
 
     # --- initial pull (Python -> page seed) ------------------------------- #
 
