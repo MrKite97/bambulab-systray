@@ -8,6 +8,8 @@ each show. The Python->page push paths (``push_state``/``push_theme``/
 points via ``window.evaluate_js``, always escaping the payload with
 ``json.dumps`` so quotes/backslashes can never break out of the JS string
 (T-07-01). Only serialize_state output (which carries no secret) is ever pushed.
+``push_update`` (Phase 13) follows the same pattern, pushing public release
+metadata to ``window.applyUpdate``.
 
 Testability: ``webview`` and the screen-metrics provider are INJECTED. The real
 ``import webview`` is lazy INSIDE :meth:`create`, so importing this module never
@@ -252,3 +254,13 @@ class FlyoutWindow:
     def push_error(self, msg):
         """Push an error banner message to ``window.applyError``."""
         self._evaluate(f"window.applyError({json.dumps(msg)})")
+
+    def push_update(self, info: dict):
+        """Push an available-update payload to ``window.applyUpdate`` (D-11).
+
+        ``info`` is a plain dict (e.g. ``{"version": str, "html_url": str}`` for the
+        banner, or ``{"upToDate": True}`` for the manual up-to-date feedback) -- NOT
+        the UpdateInfo dataclass; the caller in app.py flattens it so this stays
+        dict-only and unit-testable without importing updater. Same json.dumps-escape
+        and no-secret guarantees as the other push_* paths."""
+        self._evaluate(f"window.applyUpdate({json.dumps(info)})")

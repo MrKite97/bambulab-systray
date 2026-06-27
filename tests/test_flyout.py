@@ -289,6 +289,23 @@ def test_push_error_emits_applyError():
     assert json.dumps("oops") in code
 
 
+def test_push_update_emits_applyUpdate_with_json():
+    api, fake, fw = _make()
+    fw.create()
+    info = {"version": "2.2.0", "html_url": 'https://x/"rel"'}
+    fw.push_update(info)
+    code = fake.window.evaluated[-1]
+    assert "window.applyUpdate(" in code
+    # json.dumps-escaped so the embedded quotes can't break out of the JS string.
+    assert json.dumps(info) in code
+
+
+def test_push_update_before_create_is_noop():
+    api, fake, fw = _make()
+    fw.push_update({"version": "2.2.0", "html_url": "https://x/rel"})  # no create()
+    assert fake.window.evaluated == []
+
+
 def test_push_before_create_is_noop():
     api, fake, fw = _make()
     # no create() called
