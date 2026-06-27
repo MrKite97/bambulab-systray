@@ -1907,3 +1907,166 @@ def test_make_update_check_loop_exits_immediately_when_preset():
     loop()  # returns immediately because the startup-delay wait sees the set event
 
     assert runs["n"] == 0  # no check ran
+
+
+# --- Phase 13-03 Task 2: the five update bridge handlers --------------------
+
+
+class FakeBrowser:
+    """Records browser.open(url) calls."""
+
+    def __init__(self):
+        self.opened = []
+
+    def open(self, url):
+        self.opened.append(url)
+
+
+def test_open_release_page_opens_browser():
+    flyout = FakeUpdateFlyout()
+    browser = FakeBrowser()
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), flyout,
+        prefs_module=FakePrefsModule(), browser=browser,
+    )
+    handlers["open_release_page"]("https://github.com/o/r/releases/tag/v2.2.0")
+    assert browser.opened == ["https://github.com/o/r/releases/tag/v2.2.0"]
+
+
+def test_open_release_page_empty_url_is_noop():
+    browser = FakeBrowser()
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), FakeUpdateFlyout(),
+        prefs_module=FakePrefsModule(), browser=browser,
+    )
+    handlers["open_release_page"]("")  # falsy -> no launch
+    handlers["open_release_page"](None)
+    assert browser.opened == []
+
+
+def test_skip_update_version_persists():
+    prefs = FakePrefsModule()
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), FakeUpdateFlyout(),
+        prefs_module=prefs, browser=FakeBrowser(),
+    )
+    handlers["skip_update_version"]("2.4.0")
+    assert prefs._prefs["skipped_version"] == "2.4.0"
+    assert prefs.saves == 1
+
+
+def test_set_auto_update_persists_bool():
+    prefs = FakePrefsModule()
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), FakeUpdateFlyout(),
+        prefs_module=prefs, browser=FakeBrowser(),
+    )
+    handlers["set_auto_update"](0)  # truthiness coerced to bool
+    assert prefs._prefs["auto_update_enabled"] is False
+    handlers["set_auto_update"](1)
+    assert prefs._prefs["auto_update_enabled"] is True
+
+
+def test_dismiss_update_is_noop_returns_none():
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), FakeUpdateFlyout(),
+        prefs_module=FakePrefsModule(), browser=FakeBrowser(),
+    )
+    assert handlers["dismiss_update"]() is None
+
+
+def test_check_for_update_now_uptodate_pushes_inline_status():
+    """When the forced check returns None (up to date), the handler pushes the
+    inline {upToDate: True} status to the page (no balloon, no pop-up)."""
+    flyout = FakeUpdateFlyout()
+    # No newer release -> run_update_check returns None.
+    prefs = FakePrefsModule()
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), flyout,
+        prefs_module=prefs, browser=FakeBrowser(),
+    )
+    # Monkeypatch run_update_check indirectly: use a check returning None via the
+    # real run_update_check path. make_update_handlers calls app.run_update_check
+    # with force=True and the injected prefs_module; we drive it through the real
+    # check_for_update by patching the module-level default is overkill -- instead
+    # rely on run_update_check using check_for_update default, which would hit the
+    # network. To keep it offline, we assert via a controller resolved at call time
+    # and a None-returning check is exercised in the dedicated test below.
+    # Here we verify the up-to-date push by forcing skipped/no-newer through prefs.
+    # Simplest: call the handler and confirm an {upToDate:True} push when info None.
+    import src.app as app_mod
+
+    orig = app_mod.run_update_check
+    try:
+        app_mod.run_update_check = lambda controller, fl, **kw: None
+        handlers["check_for_update_now"]()
+    finally:
+        app_mod.run_update_check = orig
+
+    assert {"upToDate": True} in flyout.updates
+
+
+def test_check_for_update_now_resolves_controller_at_call_time():
+    """make_update_handlers must resolve the controller via the late-bind holder
+    AT CALL TIME -- it is None at build time and only filled in before the call."""
+    holder = {"controller": None}
+    flyout = FakeUpdateFlyout()
+    captured = {}
+
+    import src.app as app_mod
+
+    def _fake_run(controller, fl, **kw):
+        captured["controller"] = controller
+        return None
+
+    handlers = app.make_update_handlers(
+        lambda: holder["controller"], flyout,
+        prefs_module=FakePrefsModule(), browser=FakeBrowser(),
+    )
+    # Fill the holder AFTER the handlers were built (simulating the real late-bind).
+    live = FakeUpdateController()
+    holder["controller"] = live
+
+    orig = app_mod.run_update_check
+    try:
+        app_mod.run_update_check = _fake_run
+        handlers["check_for_update_now"]()
+    finally:
+        app_mod.run_update_check = orig
+
+    assert captured["controller"] is live  # the LIVE controller, not None
+
+
+def test_make_bridge_handlers_merges_update_handlers_with_get_controller(monkeypatch):
+    """When build_gui passes get_controller, make_bridge_handlers merges the five
+    update handlers into the dispatch map so the bridge can call them."""
+    flyout = RecordingFlyout()
+
+    class FakeSession:
+        login_submit = submit_code = resend_code = staticmethod(lambda *a: None)
+        select_printer = open_printer_select = logout = staticmethod(lambda *a: None)
+
+    handlers = app.make_bridge_handlers(
+        flyout, FakeSession(), get_controller=lambda: None
+    )
+    for name in (
+        "check_for_update_now",
+        "skip_update_version",
+        "dismiss_update",
+        "set_auto_update",
+        "open_release_page",
+    ):
+        assert name in handlers
+
+
+def test_state_provider_seeds_auto_update_enabled(monkeypatch):
+    """build_gui's _state_provider seeds autoUpdateEnabled from persisted prefs."""
+    gui, _ = _build_gui(monkeypatch)
+    # Force the persisted pref to False and re-pull the seed.
+    from src import update_prefs
+    monkeypatch.setattr(
+        update_prefs, "load_update_prefs",
+        lambda: {**update_prefs.DEFAULTS, "auto_update_enabled": False},
+    )
+    seed = gui["api"].get_initial_state()
+    assert seed["autoUpdateEnabled"] is False

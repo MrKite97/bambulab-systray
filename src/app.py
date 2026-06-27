@@ -40,6 +40,7 @@ import json
 import logging
 import threading
 import time
+import webbrowser
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -564,6 +565,75 @@ def make_update_check(
     return _loop
 
 
+def make_update_handlers(
+    get_controller,
+    flyout,
+    *,
+    prefs_module=update_prefs_module,
+    browser=webbrowser,
+):
+    """Build the five update bridge handlers (D-10). All collaborators injectable.
+
+    ``get_controller`` is a zero-arg accessor returning the LIVE controller
+    (e.g. ``lambda: _holder["controller"]``) so ``check_for_update_now`` resolves
+    it AT CALL TIME -- the controller does not exist yet when these handlers are
+    built (handlers are built ~line 988 in build_gui, the controller ~line 1048),
+    so capturing it now would bind a None controller. No credential is read or
+    logged here (only public version/url values).
+    """
+
+    def open_release_page(url):
+        # "Wat is er nieuw?" (UPD-05): open the GitHub release page. A falsy url is
+        # a no-op (no browser launch). Never crash the bridge on a launch failure.
+        if url:
+            try:
+                browser.open(str(url))
+            except Exception:  # noqa: BLE001 - launching a browser must never crash the bridge
+                logger.debug("open_release_page failed; continuing")
+        return None
+
+    def skip_update_version(version):
+        # "Deze versie overslaan" (UPD-07): persist skipped_version.
+        prefs = prefs_module.load_update_prefs()
+        prefs["skipped_version"] = version
+        prefs_module.save_update_prefs(prefs)
+        return None
+
+    def set_auto_update(enabled):
+        # Auto-check toggle (UPD-09): persist auto_update_enabled as a bool.
+        prefs = prefs_module.load_update_prefs()
+        prefs["auto_update_enabled"] = bool(enabled)
+        prefs_module.save_update_prefs(prefs)
+        return None
+
+    def dismiss_update():
+        # "Later": the page hides the banner for this session only; Python no-op.
+        return None
+
+    def check_for_update_now():
+        # Manual check (UPD-08): force a pass; the controller is resolved AT CALL
+        # TIME via the late-bind accessor. When up to date (None) push the inline
+        # "Je gebruikt de nieuwste versie" status -- NO pop-up.
+        controller = get_controller()
+        info = run_update_check(
+            controller, flyout, force=True, prefs_module=prefs_module
+        )
+        if info is None:
+            try:
+                flyout.push_update({"upToDate": True})
+            except Exception:  # noqa: BLE001 - best-effort inline feedback
+                logger.debug("push up-to-date status failed; continuing")
+        return None
+
+    return {
+        "check_for_update_now": check_for_update_now,
+        "skip_update_version": skip_update_version,
+        "dismiss_update": dismiss_update,
+        "set_auto_update": set_auto_update,
+        "open_release_page": open_release_page,
+    }
+
+
 # --- Phase 8 flyout/bridge wiring (real SessionController handlers) --------- #
 #
 # Phase 8 wires the panel auth/select actions to the REAL SessionController
@@ -678,7 +748,7 @@ def make_session(
     return SessionController(**kwargs)
 
 
-def make_bridge_handlers(flyout, session, *, start_mqtt=None):
+def make_bridge_handlers(flyout, session, *, start_mqtt=None, get_controller=None):
     """Build the js_api handler mapping wiring the panel to the SessionController.
 
     ``hide`` stays the real ``flyout.hide`` (click-away / tray toggle); the five
@@ -704,6 +774,11 @@ def make_bridge_handlers(flyout, session, *, start_mqtt=None):
         "control": make_control_handler(start_mqtt),
         "resize": flyout.resize_to,
     }
+    # Phase 13 (D-10): merge the five update handlers. ``get_controller`` is the
+    # late-bind accessor so check_for_update_now resolves the LIVE controller at
+    # call time (the controller does not exist when these handlers are built).
+    if get_controller is not None:
+        handlers.update(make_update_handlers(get_controller, flyout))
     for name in _STUB_ACTIONS:
         handlers[name] = _make_stub_action(name)
     return handlers
@@ -1040,11 +1115,17 @@ def build_gui(
             if ctrl is not None
             else ConnectionStatus.DISCONNECTED
         )
+        # Seed autoUpdateEnabled from the persisted update prefs (D-13) so the
+        # panel's auto-check toggle paints from the real value on first load.
+        auto_update_enabled = update_prefs_module.load_update_prefs().get(
+            "auto_update_enabled", True
+        )
         return bridge.serialize_state(
             state,
             connection,
             logged_in=False,
             theme=render.detect_windows_theme(),
+            auto_update_enabled=auto_update_enabled,
         )
 
     flyout = FlyoutWindow(None, webview=webview)
@@ -1085,7 +1166,14 @@ def build_gui(
     )
 
     api = bridge.Api(
-        handlers=make_bridge_handlers(flyout, session, start_mqtt=start_mqtt),
+        handlers=make_bridge_handlers(
+            flyout,
+            session,
+            start_mqtt=start_mqtt,
+            # Late-bind accessor: check_for_update_now resolves the controller at
+            # call time (it is filled into _holder after the TrayController exists).
+            get_controller=lambda: _holder["controller"],
+        ),
         state_provider=_state_provider,
     )
     flyout._api = api  # the js_api the window is created with (create() reads it)
