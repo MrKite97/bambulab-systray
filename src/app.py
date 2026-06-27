@@ -63,7 +63,12 @@ from src.flyout import FlyoutWindow
 from src.state import PrintState
 from src.status import ConnectionStatus
 from src.tray import TrayController, make_open_item
-from src.updater import check_for_update
+from src.updater import (
+    UpdateError,
+    check_for_update,
+    download_installer,
+    spawn_installer,
+)
 from src.version import __version__
 
 logger = logging.getLogger("app")
@@ -318,40 +323,113 @@ def make_status_connect(controller, inner_connect, *, on_auth_fail):
     return _connect
 
 
-def make_quit_handler(client, shutdown_event, *, flyout=None):
-    """Build the 'Afsluiten' menu callback that tears down the GUI + both threads.
+def _run_quit_sequence(icon, client, shutdown_event, *, flyout=None):
+    """The ONE locked deadlock-safe teardown order (LOCKED -- 07-CONTEXT.md).
 
-    CANONICAL ORDER (LOCKED, deadlock-safety -- 07-CONTEXT.md "Threading model"):
-    because ``webview.start()`` blocks the MAIN thread until every window is
-    destroyed, the flyout window MUST be destroyed FIRST -- otherwise the main
-    thread stays parked in ``webview.start()`` forever (deadlock) and the process
-    never exits. The exact sequence:
+    Reused BYTE-IDENTICALLY by both 'Afsluiten' (:func:`make_quit_handler`) and
+    'Nu bijwerken' (:func:`make_update_apply`) so the load-bearing quit order can
+    NEVER drift between the two paths. Because ``webview.start()`` blocks the MAIN
+    thread until every window is destroyed, the flyout window MUST be destroyed
+    FIRST -- otherwise the main thread stays parked in ``webview.start()`` forever
+    (deadlock). Order (each step guarded; ``icon.stop()`` ALWAYS reached):
 
       a. ``flyout.destroy()``    -- FIRST: unblocks the main thread's webview.start()
       b. ``shutdown_event.set()``
-      c. ``client.disconnect()`` -- ends loop_forever -> run_session sees a clean end
-      d. ``icon.stop()``         -- disposes the tray icon (NO orphan)
+      c. ``client.disconnect()`` -- ends loop_forever -> run_session clean end
+      d. ``icon.stop()``         -- disposes the tray icon (NO orphan); always reached
 
-    Every teardown step is wrapped so the quit path NEVER raises and NEVER leaves
-    an orphan icon: ``icon.stop()`` is reached even if destroy/disconnect fail
-    (T-02-07 / T-07-06). ``flyout`` is optional so the v1 console/tray-only path
-    (no window) keeps working; when None the sequence is just b->c->d.
+    ``flyout`` is optional so the v1 console/tray-only path (no window) keeps
+    working; when None the sequence is just b->c->d.
+    """
+    if flyout is not None:
+        try:
+            flyout.destroy()  # FIRST: unblocks the main thread's webview.start()
+        except Exception:  # noqa: BLE001 - teardown must never block the rest
+            logger.debug("flyout.destroy() raised during teardown; continuing")
+    shutdown_event.set()
+    try:
+        client.disconnect()  # ends loop_forever -> run_session sees a clean end
+    except Exception:  # noqa: BLE001 - teardown must never block icon disposal
+        logger.debug("client.disconnect() raised during teardown; continuing to icon.stop()")
+    icon.stop()  # disposes the tray icon (NO orphan); always reached
+
+
+def make_quit_handler(client, shutdown_event, *, flyout=None):
+    """Build the 'Afsluiten' menu callback that tears down the GUI + both threads.
+
+    Delegates to the SHARED :func:`_run_quit_sequence` so 'Afsluiten' and the
+    'Nu bijwerken' apply path tear down in the IDENTICAL locked order (the
+    deadlock-safe flyout.destroy -> shutdown_event.set -> client.disconnect ->
+    icon.stop sequence -- see that helper's docstring for the full rationale).
+    ``flyout`` is optional (v1 console/tray-only path keeps working).
     """
 
     def _on_quit(icon, item):
-        if flyout is not None:
-            try:
-                flyout.destroy()  # FIRST: unblocks the main thread's webview.start()
-            except Exception:  # noqa: BLE001 - teardown must never block the rest
-                logger.debug("flyout.destroy() raised during quit; continuing")
-        shutdown_event.set()
-        try:
-            client.disconnect()  # ends loop_forever -> run_session sees a clean end
-        except Exception:  # noqa: BLE001 - teardown must never block icon disposal
-            logger.debug("client.disconnect() raised during quit; continuing to icon.stop()")
-        icon.stop()  # disposes the tray icon (NO orphan); always reached
+        _run_quit_sequence(icon, client, shutdown_event, flyout=flyout)
 
     return _on_quit
+
+
+# The Dutch failure banner for a download/verify failure (D-07): the apply path
+# is VISIBLE on failure -- never a silent no-op (UPD-06 success criterion 1).
+UPDATE_FAILED_MESSAGE = "Bijwerken mislukt — probeer het later opnieuw"
+
+
+def _push_update_failed(flyout):
+    """Surface the Dutch update-failure banner; never raises into the caller."""
+    try:
+        flyout.push_error(UPDATE_FAILED_MESSAGE)
+    except Exception:  # noqa: BLE001 - the failure surface must not itself crash
+        logger.debug("flyout.push_error failed while reporting update failure")
+
+
+def make_update_apply(
+    icon,
+    client,
+    shutdown_event,
+    flyout,
+    *,
+    get_update_info,
+    download=download_installer,
+    spawn=spawn_installer,
+):
+    """Build the 'Nu bijwerken' handler: download -> verify -> spawn -> teardown (D-06/D-07).
+
+    ``get_update_info`` is a zero-arg accessor yielding the LATEST UpdateInfo (or
+    None) found by the update-check loop. ``download``/``spawn`` are injectable
+    (default the real updater functions) so tests drive the whole path with fakes
+    -- NO real network, NO real process launch.
+
+    VERIFY-BEFORE-SPAWN (the load-bearing safety order):
+      1. ``download_installer(info)`` -- streams + verifies size + SHA-256; raises
+         ``UpdateError`` on ANY mismatch/error (no path returned).
+      2. on ``UpdateError`` / no info -> ``flyout.push_error(...)`` and RETURN: the
+         app keeps running, the installer is NEVER spawned, NO teardown happens (D-07).
+      3. ``spawn_installer(path)`` -- ONLY reached on a verified download; detached,
+         returns immediately (the installer then waits on AppMutex).
+      4. :func:`_run_quit_sequence` -- the EXACT locked quit order so the app exits;
+         AppMutex releases -> the installer swaps the exe + relaunches non-elevated.
+    """
+
+    def _apply(*_args, **_kwargs):
+        info = get_update_info()
+        if info is None:
+            _push_update_failed(flyout)
+            return None
+        try:
+            path = download(info)  # raises UpdateError on mismatch/error
+        except UpdateError:
+            # VISIBLE failure (D-07): never a silent no-op, never spawn, never tear down.
+            logger.debug("update download/verify failed; surfacing error, staying up")
+            _push_update_failed(flyout)
+            return None
+        # Verified: start the detached installer FIRST (it waits on AppMutex), THEN
+        # run the exact locked quit order so we exit and let it proceed.
+        spawn(path)
+        _run_quit_sequence(icon, client, shutdown_event, flyout=flyout)
+        return None
+
+    return _apply
 
 
 class _ReloginHandler:

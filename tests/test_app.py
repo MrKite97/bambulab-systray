@@ -207,6 +207,122 @@ def test_quit_handler_stops_icon_even_if_disconnect_raises():
     assert icon.stop_count == 1  # icon still disposed despite disconnect error
 
 
+# --- Phase 14: make_update_apply (download -> verify -> spawn -> teardown) --- #
+
+
+class _OrderRecorder:
+    """A single ordered list every fake appends to, so the download -> spawn ->
+    teardown call order is observable end-to-end."""
+
+    def __init__(self):
+        self.events = []
+
+
+def _apply_fakes(order, *, download_raises=False, info=object()):
+    """Build the icon/client/flyout/download/spawn fakes wired to one recorder."""
+
+    class _Icon:
+        def stop(self):
+            order.events.append("stop")
+
+    class _Client:
+        def disconnect(self):
+            order.events.append("disconnect")
+
+    class _Flyout:
+        def destroy(self):
+            order.events.append("destroy")
+
+        def push_error(self, msg):
+            order.events.append(("push_error", msg))
+
+    def _download(i):
+        order.events.append("download")
+        if download_raises:
+            raise app.UpdateError("boom")
+        return "C:/Temp/Setup.exe"
+
+    def _spawn(path):
+        order.events.append("spawn")
+
+    return _Icon(), _Client(), _Flyout(), _download, _spawn
+
+
+def test_make_update_apply_success_order():
+    """On a verified download: download -> spawn -> (destroy -> disconnect ->
+    stop), proving verify-before-spawn THEN the exact locked quit order."""
+    order = _OrderRecorder()
+    info = object()
+    icon, client, flyout, download, spawn = _apply_fakes(order, info=info)
+    event = threading.Event()
+
+    apply = app.make_update_apply(
+        icon,
+        client,
+        event,
+        flyout,
+        get_update_info=lambda: info,
+        download=download,
+        spawn=spawn,
+    )
+    apply()
+
+    assert order.events == ["download", "spawn", "destroy", "disconnect", "stop"]
+    assert event.is_set()
+
+
+def test_make_update_apply_failure_no_spawn_no_teardown():
+    """A download/verify failure pushes a visible error and does NOT spawn or tear
+    down -- the app keeps running."""
+    order = _OrderRecorder()
+    info = object()
+    icon, client, flyout, download, spawn = _apply_fakes(
+        order, download_raises=True, info=info
+    )
+    event = threading.Event()
+
+    apply = app.make_update_apply(
+        icon,
+        client,
+        event,
+        flyout,
+        get_update_info=lambda: info,
+        download=download,
+        spawn=spawn,
+    )
+    apply()
+
+    assert ("push_error", app.UPDATE_FAILED_MESSAGE) in order.events
+    assert "spawn" not in order.events
+    assert "destroy" not in order.events
+    assert "disconnect" not in order.events
+    assert "stop" not in order.events
+    assert not event.is_set()  # app stays up
+
+
+def test_make_update_apply_no_info_pushes_error_no_spawn():
+    """No actionable UpdateInfo -> push_error, never download/spawn/teardown."""
+    order = _OrderRecorder()
+    icon, client, flyout, download, spawn = _apply_fakes(order)
+    event = threading.Event()
+
+    apply = app.make_update_apply(
+        icon,
+        client,
+        event,
+        flyout,
+        get_update_info=lambda: None,
+        download=download,
+        spawn=spawn,
+    )
+    apply()
+
+    assert ("push_error", app.UPDATE_FAILED_MESSAGE) in order.events
+    assert "download" not in order.events
+    assert "spawn" not in order.events
+    assert not event.is_set()
+
+
 # --- on_message signalling --------------------------------------------------
 
 
