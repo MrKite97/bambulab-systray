@@ -1706,3 +1706,204 @@ def test_stop_session_ends_session_without_global_shutdown(monkeypatch):
     assert not gui["shutdown_event"].is_set()
     # The tray was reset to the neutral logged-out display (no stale print).
     assert gui["controller"]._status is app.ConnectionStatus.DISCONNECTED
+
+
+# --- Phase 13-02 Task 3: update-check loop + daemon thread ------------------
+#
+# run_update_check is driven directly with fakes: a FakeUpdateController records
+# signal_update_available, a FakeUpdateFlyout records push_update, a fake `check`
+# returns a canned UpdateInfo / None, and a FakePrefsModule backs load/save with
+# an in-memory dict. make_update_check's loop exit is proven with a pre-set
+# shutdown event (no real waits).
+
+
+class FakeUpdateController:
+    """Records signal_update_available(version, url) calls (the one-time balloon)."""
+
+    def __init__(self):
+        self.signals = []
+
+    def signal_update_available(self, version, url):
+        self.signals.append((version, url))
+
+
+class FakeUpdateFlyout:
+    """Records push_update(info) calls (the banner / up-to-date feedback)."""
+
+    def __init__(self):
+        self.updates = []
+
+    def push_update(self, info):
+        self.updates.append(info)
+
+
+class FakePrefsModule:
+    """In-memory update_prefs stand-in: load returns the live dict, save replaces it."""
+
+    def __init__(self, prefs=None):
+        from src.update_prefs import DEFAULTS
+
+        self._prefs = dict(DEFAULTS)
+        if prefs:
+            self._prefs.update(prefs)
+        self.saves = 0
+
+    def load_update_prefs(self):
+        return dict(self._prefs)
+
+    def save_update_prefs(self, prefs):
+        self.saves += 1
+        self._prefs = dict(prefs)
+
+
+def _info(version="2.2.0", etag='W/"e"'):
+    from src.updater import UpdateInfo
+
+    return UpdateInfo(
+        version=version,
+        tag="v" + version,
+        html_url="https://github.com/o/r/releases/tag/v" + version,
+        asset_name=None,
+        asset_url=None,
+        asset_size=None,
+        sha256_url=None,
+        etag=etag,
+    )
+
+
+def test_run_update_check_auto_disabled_skips_check():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule({"auto_update_enabled": False})
+    called = {"n": 0}
+
+    def _check(*, current, etag):
+        called["n"] += 1
+        return _info()
+
+    result = app.run_update_check(
+        ctrl, flyout, check=_check, prefs_module=prefs, current="2.1.0"
+    )
+
+    assert result is None
+    assert called["n"] == 0  # check was NOT run
+    assert flyout.updates == []
+    assert ctrl.signals == []
+
+
+def test_run_update_check_force_bypasses_auto_disabled():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule({"auto_update_enabled": False})
+
+    result = app.run_update_check(
+        ctrl,
+        flyout,
+        check=lambda *, current, etag: _info(),
+        prefs_module=prefs,
+        current="2.1.0",
+        force=True,
+    )
+
+    assert result is not None  # forced through despite auto disabled
+    assert flyout.updates  # banner pushed
+
+
+def test_run_update_check_none_persists_last_check_no_notify():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule()
+
+    result = app.run_update_check(
+        ctrl,
+        flyout,
+        check=lambda *, current, etag: None,
+        prefs_module=prefs,
+        current="2.1.0",
+    )
+
+    assert result is None
+    assert flyout.updates == []  # no banner
+    assert ctrl.signals == []  # no balloon
+    assert prefs.saves == 1  # last_check still persisted
+    assert prefs._prefs["last_check"] is not None
+
+
+def test_run_update_check_banner_always_balloon_once():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule()
+
+    # First pass: banner + balloon, last_notified_version persisted.
+    app.run_update_check(
+        ctrl, flyout, check=lambda *, current, etag: _info("2.2.0"),
+        prefs_module=prefs, current="2.1.0",
+    )
+    assert flyout.updates == [{"version": "2.2.0", "html_url": _info("2.2.0").html_url}]
+    assert ctrl.signals == [("2.2.0", _info("2.2.0").html_url)]
+    assert prefs._prefs["last_notified_version"] == "2.2.0"
+
+    # Second pass, SAME version: banner AGAIN, but NO second balloon.
+    app.run_update_check(
+        ctrl, flyout, check=lambda *, current, etag: _info("2.2.0"),
+        prefs_module=prefs, current="2.1.0",
+    )
+    assert len(flyout.updates) == 2  # banner pushed again
+    assert len(ctrl.signals) == 1  # balloon NOT fired again
+
+
+def test_run_update_check_skipped_version_suppressed():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule({"skipped_version": "2.2.0"})
+
+    result = app.run_update_check(
+        ctrl, flyout, check=lambda *, current, etag: _info("2.2.0"),
+        prefs_module=prefs, current="2.1.0",
+    )
+
+    assert result is not None  # info returned (for the manual-check caller)
+    assert flyout.updates == []  # NO banner
+    assert ctrl.signals == []  # NO balloon
+    assert prefs.saves == 1  # last_check/etag still persisted
+
+
+def test_run_update_check_persists_etag_from_result():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule()
+
+    captured = {}
+
+    def _check(*, current, etag):
+        captured["etag_in"] = etag
+        return _info("2.2.0", etag='W/"fresh"')
+
+    app.run_update_check(
+        ctrl, flyout, check=_check, prefs_module=prefs, current="2.1.0"
+    )
+
+    assert captured["etag_in"] is None  # first call, no cached etag
+    assert prefs._prefs["etag"] == 'W/"fresh"'  # fresh etag persisted
+
+
+def test_make_update_check_loop_exits_immediately_when_preset():
+    ctrl = FakeUpdateController()
+    flyout = FakeUpdateFlyout()
+    prefs = FakePrefsModule()
+    shutdown = threading.Event()
+    shutdown.set()  # pre-set: the startup-delay wait returns True -> loop returns
+
+    runs = {"n": 0}
+
+    def _check(*, current, etag):
+        runs["n"] += 1
+        return None
+
+    loop = app.make_update_check(
+        ctrl, flyout, shutdown, check=_check, prefs_module=prefs,
+        interval=0.01, startup_delay=0.01,
+    )
+    loop()  # returns immediately because the startup-delay wait sees the set event
+
+    assert runs["n"] == 0  # no check ran

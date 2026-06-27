@@ -40,6 +40,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pystray
@@ -55,11 +56,14 @@ from src import (
     single_instance,
     spike,
     token_store,
+    update_prefs as update_prefs_module,
 )
 from src.flyout import FlyoutWindow
 from src.state import PrintState
 from src.status import ConnectionStatus
 from src.tray import TrayController, make_open_item
+from src.updater import check_for_update
+from src.version import __version__
 
 logger = logging.getLogger("app")
 
@@ -462,6 +466,102 @@ def make_connect(shutdown_event):
             raise mqtt_client.StopSession()
 
     return _connect
+
+
+# --- Phase 13 update-check loop + daemon thread (D-07, D-08) ---------------- #
+#
+# ~daily auto-check cadence + a short startup delay so the check doesn't fight the
+# MQTT connect (D-07). Both injectable in make_update_check for fast tests.
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+UPDATE_CHECK_STARTUP_DELAY_SECONDS = 10
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string (for the persisted last_check stamp)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_update_check(
+    controller,
+    flyout,
+    *,
+    check=check_for_update,
+    prefs_module=update_prefs_module,
+    current=None,
+    force=False,
+):
+    """One update-check pass (D-08). Never raises.
+
+    Gates on ``auto_update_enabled`` unless ``force`` (the manual "Controleer op
+    updates" path, Plan 03) bypasses it. ALWAYS persists ``last_check`` (+ a fresh
+    ``etag`` when the result carries one). Pushes the panel banner on EVERY
+    actionable (newer, non-skipped) check, and fires the tray balloon ONCE per
+    version (``info.version != last_notified_version``). Returns the UpdateInfo
+    found (or None) so the manual bridge handler can give inline 'up to date'
+    feedback. No secret is logged here -- only public version/url values.
+    """
+    prefs = prefs_module.load_update_prefs()
+    if not force and not prefs.get("auto_update_enabled", True):
+        return None
+    info = check(current=current or __version__, etag=prefs.get("etag"))
+    # Always record we checked; capture a fresh etag when present.
+    prefs["last_check"] = _utc_now_iso()
+    if info is not None and getattr(info, "etag", None):
+        prefs["etag"] = info.etag
+    if info is None:
+        prefs_module.save_update_prefs(prefs)  # soft-fail: last_check only, no notify
+        return None
+    if info.version == prefs.get("skipped_version"):
+        prefs_module.save_update_prefs(prefs)  # skipped: persist last_check/etag, no notify
+        return info
+    # Banner ALWAYS (best-effort, fire-and-forget).
+    try:
+        flyout.push_update({"version": info.version, "html_url": info.html_url})
+    except Exception:  # noqa: BLE001 - panel push is best-effort
+        logger.debug("flyout push_update failed; continuing")
+    # Balloon ONCE per version (D-08 / UPD-04).
+    if info.version != prefs.get("last_notified_version"):
+        try:
+            controller.signal_update_available(info.version, info.html_url)
+        except Exception:  # noqa: BLE001 - enqueue must never crash the check
+            logger.debug("signal_update_available failed; continuing")
+        prefs["last_notified_version"] = info.version
+    prefs_module.save_update_prefs(prefs)
+    return info
+
+
+def make_update_check(
+    controller,
+    flyout,
+    shutdown_event,
+    *,
+    interval=UPDATE_CHECK_INTERVAL_SECONDS,
+    startup_delay=UPDATE_CHECK_STARTUP_DELAY_SECONDS,
+    check=check_for_update,
+    prefs_module=update_prefs_module,
+):
+    """Build the zero-arg target for the daemon 'update-check' thread (D-07).
+
+    Sleeps ``startup_delay`` (via ``shutdown_event.wait`` so quit is prompt), then
+    runs a check and loops every ``interval`` -- each ``wait`` returning True means
+    shutdown was requested, so it breaks. Each pass is guarded so one failure never
+    kills the thread (the check itself already soft-fails to None; this guards the
+    rest)."""
+
+    def _loop():
+        if shutdown_event.wait(timeout=startup_delay):
+            return
+        while True:
+            try:
+                run_update_check(
+                    controller, flyout, check=check, prefs_module=prefs_module
+                )
+            except Exception:  # noqa: BLE001 - one bad pass must not kill the daemon
+                logger.debug("update-check pass raised; continuing", exc_info=False)
+            if shutdown_event.wait(timeout=interval):
+                return
+
+    return _loop
 
 
 # --- Phase 8 flyout/bridge wiring (real SessionController handlers) --------- #
@@ -1303,6 +1403,18 @@ def main(argv=None, *, guard=None, webview=None) -> int:
     # the MAIN thread is free to run webview.start(). make_setup paints the first
     # frame AND starts the single UI pump thread when the icon becomes visible.
     icon.run_detached(setup=make_setup(controller, shutdown_event))
+
+    # Phase 13 (D-07): start the daemon 'update-check' thread now that the
+    # controller + flyout + shutdown_event exist. It sleeps a short startup delay
+    # (so it doesn't fight the MQTT connect), then checks GitHub ~daily; each pass
+    # soft-fails to None offline and never pops up on nothing. It enqueues the
+    # one-time balloon (drained by the tray pump on the UI thread) and pushes the
+    # panel banner -- never touching the icon off-thread.
+    threading.Thread(
+        target=make_update_check(controller, flyout, shutdown_event),
+        name="update-check",
+        daemon=True,
+    ).start()
 
     # The MAIN thread now enters the GUI loop and blocks until the flyout window
     # is destroyed (the Afsluiten handler calls flyout.destroy() FIRST).
