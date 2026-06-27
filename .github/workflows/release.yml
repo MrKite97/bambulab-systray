@@ -88,6 +88,12 @@ jobs:
 
       - name: Compile installer (ISCC)
         shell: bash
+        env:
+          # Stop Git-bash/MSYS from rewriting the "/DMyAppVersion=..." arg into a
+          # Windows path (which made ISCC see it as a 2nd script filename ->
+          # "You may not specify more than one script filename").
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
           "$ISCC" "/DMyAppVersion=$VERSION" installer/bambulab-systray.iss
