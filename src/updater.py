@@ -33,10 +33,10 @@ from src.version import __version__, parse_version
 
 logger = logging.getLogger("updater")
 
-# Repo owner is a TODO placeholder until the public repo is created (D-02). The
-# user sets the real owner at Phase 12 go-public; until then the check soft-fails
-# (404) against this placeholder, which is the correct calm behavior.
-REPO = "OWNER-TODO/bambulab-systray"
+# The public GitHub repo the update check + 1-click update read from (D-02).
+# Set at Phase 12 go-public; the check soft-fails (404/offline) if it ever can't
+# reach this, which is the correct calm behavior.
+REPO = "MrKite97/bambulab-systray"
 _API_URL = "https://api.github.com/repos/{repo}/releases/latest"
 _ACCEPT = "application/vnd.github+json"
 
