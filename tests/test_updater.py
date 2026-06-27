@@ -10,6 +10,10 @@ Threats under test (Phase 13 register):
 - T-13-02 (DoS): any exception (incl. timeout) soft-fails to None.
 """
 
+import hashlib
+
+import pytest
+
 from src import updater
 from src.updater import UpdateInfo, check_for_update
 
@@ -189,3 +193,192 @@ def test_default_current_uses_module_version():
     # No explicit current: defaults to __version__ (2.1.0); 2.0.0 is older -> None.
     resp = _FakeResp(200, _newer_json(tag="2.0.0"))
     assert check_for_update(get=_make_get(resp)) is None
+
+
+# --- Phase 14: download_installer (stream + verify size + SHA-256) ---------- #
+
+
+class _FakeStreamResp:
+    """Stand-in for a streaming requests.Response: .iter_content + .text.
+
+    The asset response yields ``chunks`` from .iter_content; the sidecar response
+    exposes ``text``. Either may be used for a given fake (whichever the code path
+    reads). No real network.
+    """
+
+    def __init__(self, *, chunks=None, text=None):
+        self._chunks = list(chunks or [])
+        self.text = text or ""
+
+    def iter_content(self, chunk_size=None):
+        for c in self._chunks:
+            yield c
+
+
+def _info(
+    *,
+    asset_url="https://example/BambuLabSystray-Setup-2.2.0.exe",
+    asset_name="BambuLabSystray-Setup-2.2.0.exe",
+    asset_size=None,
+    sha256_url="https://example/BambuLabSystray-Setup-2.2.0.exe.sha256",
+):
+    """Build a minimal UpdateInfo for the download tests."""
+    return UpdateInfo(
+        version="2.2.0",
+        tag="v2.2.0",
+        html_url="https://example/releases/tag/v2.2.0",
+        asset_name=asset_name,
+        asset_url=asset_url,
+        asset_size=asset_size,
+        sha256_url=sha256_url,
+        etag=None,
+    )
+
+
+def _make_download_get(asset_chunks, sidecar_text):
+    """Return a fake get(url, ...) that serves asset bytes (stream=True) vs sidecar.
+
+    The streaming asset fetch is identified by ``stream=True``; the sidecar fetch
+    (no stream kwarg) returns the .sha256 body via .text.
+    """
+
+    def _get(url, *, stream=False, timeout=None):
+        if stream:
+            return _FakeStreamResp(chunks=asset_chunks)
+        return _FakeStreamResp(text=sidecar_text)
+
+    return _get
+
+
+def test_download_installer_returns_path_when_size_and_sha_match(tmp_path):
+    body = b"the installer bytes" * 100
+    digest = hashlib.sha256(body).hexdigest()
+    info = _info(asset_size=len(body))
+    get = _make_download_get([body], f"{digest}  Setup.exe\n")
+
+    path = updater.download_installer(info, get=get, dest_dir=str(tmp_path))
+
+    assert path.exists()
+    assert path.read_bytes() == body
+    assert path.name == "BambuLabSystray-Setup-2.2.0.exe"
+
+
+def test_download_installer_sha_mismatch_raises_and_deletes(tmp_path):
+    body = b"genuine bytes"
+    wrong = hashlib.sha256(b"tampered").hexdigest()
+    info = _info()
+    get = _make_download_get([body], f"{wrong}  Setup.exe")
+
+    with pytest.raises(updater.UpdateError):
+        updater.download_installer(info, get=get, dest_dir=str(tmp_path))
+
+    # The partial/failed download is deleted -- never left on disk.
+    assert not (tmp_path / info.asset_name).exists()
+
+
+def test_download_installer_size_mismatch_raises(tmp_path):
+    body = b"0123456789"
+    digest = hashlib.sha256(body).hexdigest()
+    info = _info(asset_size=999)  # advertised size != actual streamed bytes
+    get = _make_download_get([body], f"{digest}  Setup.exe")
+
+    with pytest.raises(updater.UpdateError):
+        updater.download_installer(info, get=get, dest_dir=str(tmp_path))
+    assert not (tmp_path / info.asset_name).exists()
+
+
+def test_download_installer_get_raises_no_partial(tmp_path):
+    info = _info()
+
+    def _boom(url, *, stream=False, timeout=None):
+        raise ConnectionError("offline")
+
+    with pytest.raises(updater.UpdateError):
+        updater.download_installer(info, get=_boom, dest_dir=str(tmp_path))
+    assert not (tmp_path / info.asset_name).exists()
+
+
+def test_download_installer_no_sha_url_raises_without_get(tmp_path):
+    info = _info(sha256_url=None)
+    called = {"n": 0}
+
+    def _get(url, *, stream=False, timeout=None):
+        called["n"] += 1
+        return _FakeStreamResp(chunks=[b"x"])
+
+    with pytest.raises(updater.UpdateError):
+        updater.download_installer(info, get=_get, dest_dir=str(tmp_path))
+    assert called["n"] == 0  # never trust -> never even fetch
+
+
+def test_download_installer_no_asset_url_raises_without_get(tmp_path):
+    info = _info(asset_url=None)
+    called = {"n": 0}
+
+    def _get(url, *, stream=False, timeout=None):
+        called["n"] += 1
+        return _FakeStreamResp(chunks=[b"x"])
+
+    with pytest.raises(updater.UpdateError):
+        updater.download_installer(info, get=_get, dest_dir=str(tmp_path))
+    assert called["n"] == 0
+
+
+def test_download_installer_sha_is_case_insensitive(tmp_path):
+    body = b"case insensitive hash check"
+    digest = hashlib.sha256(body).hexdigest().upper()  # sidecar in UPPER case
+    info = _info(asset_size=len(body))
+    get = _make_download_get([body], f"{digest}  Setup.exe")
+
+    path = updater.download_installer(info, get=get, dest_dir=str(tmp_path))
+    assert path.exists()
+
+
+# --- Phase 14: spawn_installer (detached, silent, relaunch) ----------------- #
+
+
+class _SpawnRecorder:
+    """Records the single spawn call (args + kwargs) and a no-wait handle."""
+
+    def __init__(self):
+        self.calls = []
+        self.handle = _FakeProcHandle()
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.handle
+
+
+class _FakeProcHandle:
+    """A fake Popen return value whose .wait increments a counter (asserted 0)."""
+
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self, *a, **k):
+        self.wait_count += 1
+
+
+def test_spawn_installer_exact_args_and_flags():
+    rec = _SpawnRecorder()
+    result = updater.spawn_installer(r"C:\Temp\Setup.exe", spawn=rec)
+
+    assert result is None
+    assert len(rec.calls) == 1
+    args, kwargs = rec.calls[0]
+    assert args == [
+        r"C:\Temp\Setup.exe",
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        "/RESTARTAPPLICATIONS",
+    ]
+    assert kwargs["creationflags"] == 0x208
+    assert kwargs["close_fds"] is True
+
+
+def test_spawn_installer_does_not_wait():
+    rec = _SpawnRecorder()
+    updater.spawn_installer(r"C:\Temp\Setup.exe", spawn=rec)
+    assert rec.handle.wait_count == 0  # returns immediately, never waits

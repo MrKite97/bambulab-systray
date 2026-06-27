@@ -20,7 +20,12 @@ can consume them later (UPD-06 SHA-256 verify gates execution there, not here).
 """
 
 from dataclasses import dataclass
+import hashlib
 import logging
+import os
+import subprocess
+import tempfile
+from pathlib import Path
 
 import requests
 
@@ -145,3 +150,128 @@ def check_for_update(
         sha256_url=sha256_url,
         etag=resp_etag,
     )
+
+
+# --- Phase 14: download + verify + spawn (UPD-06, verify-before-trust) ------ #
+
+
+class UpdateError(Exception):
+    """A 1-click update could not be completed safely (download or integrity
+    failure). Raised by download_installer so the caller surfaces a VISIBLE
+    failure (flyout.push_error) and NEVER spawns the installer (UPD-06)."""
+
+
+_DOWNLOAD_CHUNK = 1024 * 256  # 256 KiB streaming chunks
+
+
+def _expected_sha256(sha_text: str) -> str:
+    """First whitespace-delimited token of the .sha256 sidecar, lowercased."""
+    tokens = (sha_text or "").split()
+    if not tokens:
+        raise UpdateError("empty .sha256 sidecar")
+    return tokens[0].strip().lower()
+
+
+def _delete_partial(path: Path) -> None:
+    """Best-effort delete of a failed/partial download (never raises)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def download_installer(
+    info: "UpdateInfo",
+    *,
+    get=requests.get,
+    dest_dir=None,
+) -> Path:
+    """Stream the Setup asset to a temp dir and verify size + SHA-256 BEFORE
+    returning its Path. Raise UpdateError on ANY mismatch/error (and delete the
+    partial file); NEVER return a path on failure, NEVER spawn (D-01/D-02/D-03).
+
+    ``get`` is injectable (default requests.get) so tests use a fake -- no real
+    network. ``dest_dir`` defaults to the system temp dir.
+    """
+    if not info.asset_url or not info.sha256_url:
+        # Cannot verify integrity -> never trust. (No asset or no sidecar.)
+        raise UpdateError("update asset or .sha256 sidecar missing")
+
+    dest_dir = dest_dir or tempfile.gettempdir()
+    dest = Path(dest_dir) / (info.asset_name or "BambuLabSystray-Setup.exe")
+
+    sha = hashlib.sha256()
+    size = 0
+    try:
+        # 1) Stream the binary asset to disk, hashing as we write.
+        resp = get(info.asset_url, stream=True, timeout=60)
+        with open(dest, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=_DOWNLOAD_CHUNK):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                sha.update(chunk)
+                size += len(chunk)
+
+        # 2) Verify size (when the release advertised one).
+        if info.asset_size is not None and size != info.asset_size:
+            raise UpdateError(
+                f"size mismatch: got {size}, expected {info.asset_size}"
+            )
+
+        # 3) Fetch the .sha256 sidecar and compare (case-insensitive).
+        sha_resp = get(info.sha256_url, timeout=30)
+        expected = _expected_sha256(getattr(sha_resp, "text", "") or "")
+        actual = sha.hexdigest().lower()
+        if actual != expected:
+            raise UpdateError("SHA-256 mismatch")
+    except UpdateError:
+        _delete_partial(dest)
+        raise
+    except Exception as exc:  # noqa: BLE001 - any download/IO error -> UpdateError
+        _delete_partial(dest)
+        raise UpdateError(f"download failed: {type(exc).__name__}") from exc
+
+    return dest
+
+
+# Win32 process-creation flags: run the installer FULLY DETACHED so it survives
+# this app's imminent exit and never shares our console/handles (D-04).
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+# The EXACT silent + relaunch flags the Phase 11 installer declares
+# (installer/bambulab-systray.iss). Order + spelling are load-bearing.
+INSTALLER_SILENT_ARGS = (
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/CLOSEAPPLICATIONS",
+    "/RESTARTAPPLICATIONS",
+)
+
+
+def spawn_installer(installer_path, *, spawn=subprocess.Popen) -> None:
+    """Launch the verified installer FULLY DETACHED and return immediately (D-04/D-05).
+
+    The installer is started with the exact silent + relaunch flags the Phase 11
+    .iss supports and with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so it
+    outlives THIS process. It does NOT wait -- the caller proceeds straight to the
+    locked quit sequence so the app exits; the installer then blocks on
+    AppMutex=Global\\BambuLabSystray_singleton (single_instance.MUTEX_NAME) until
+    the app is gone, swaps the exe, and relaunches it non-elevated.
+
+    ``spawn`` is injectable (default subprocess.Popen) so tests assert the exact
+    args + creationflags with a recorder -- no real process is launched.
+    """
+    args = [str(installer_path), *INSTALLER_SILENT_ARGS]
+    spawn(
+        args,
+        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        close_fds=True,
+        stdin=None,
+        stdout=None,
+        stderr=None,
+    )
+    # Deliberately NO .wait(): return immediately so app.py can run the locked
+    # quit order. The installer waits on AppMutex for our exit.
