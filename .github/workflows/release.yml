@@ -69,11 +69,20 @@ jobs:
           pyinstaller bambulab-systray.spec
           test -f dist/bambulab-systray.exe || { echo "::error::PyInstaller did not produce dist/bambulab-systray.exe"; exit 1; }
 
-      - name: Install Inno Setup (pinned — windows-latest does NOT preinstall it)
+      - name: Ensure Inno Setup is available
         shell: bash
         run: |
-          choco install innosetup --version=6.2.2 -y --no-progress
+          # windows-latest now ships Inno Setup 6 preinstalled (e.g. v6.7.1).
+          # Use it if present; only install via Chocolatey when it is missing.
+          # (Do NOT pin an older version — choco fails if a newer one is already
+          # installed.) ISCC 6.x always lives in the "Inno Setup 6" folder.
           ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$ISCC" ]; then
+            echo "Inno Setup not found — installing via Chocolatey..."
+            choco install innosetup -y --no-progress
+          else
+            echo "Using preinstalled Inno Setup."
+          fi
           test -f "$ISCC" || { echo "::error::ISCC.exe not found at expected path"; exit 1; }
           echo "ISCC=$ISCC" >> "$GITHUB_ENV"
 
