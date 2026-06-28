@@ -264,10 +264,18 @@ def test_make_update_apply_success_order():
         get_update_info=lambda: info,
         download=download,
         spawn=spawn,
+        exit_process=lambda c: order.events.append(("exit", c)),
     )
     apply()
 
-    assert order.events == ["download", "spawn", "destroy", "disconnect", "stop"]
+    assert order.events == [
+        "download",
+        "spawn",
+        "destroy",
+        "disconnect",
+        "stop",
+        ("exit", 0),
+    ]
     assert event.is_set()
 
 
@@ -289,6 +297,7 @@ def test_make_update_apply_failure_no_spawn_no_teardown():
         get_update_info=lambda: info,
         download=download,
         spawn=spawn,
+        exit_process=lambda c: order.events.append(("exit", c)),
     )
     apply()
 
@@ -297,6 +306,7 @@ def test_make_update_apply_failure_no_spawn_no_teardown():
     assert "destroy" not in order.events
     assert "disconnect" not in order.events
     assert "stop" not in order.events
+    assert ("exit", 0) not in order.events  # never hard-exit on a failed update
     assert not event.is_set()  # app stays up
 
 
@@ -314,12 +324,80 @@ def test_make_update_apply_no_info_pushes_error_no_spawn():
         get_update_info=lambda: None,
         download=download,
         spawn=spawn,
+        exit_process=lambda c: order.events.append(("exit", c)),
     )
     apply()
 
     assert ("push_error", app.UPDATE_FAILED_MESSAGE) in order.events
     assert "download" not in order.events
     assert "spawn" not in order.events
+    assert ("exit", 0) not in order.events  # no info -> never hard-exit
+    assert not event.is_set()
+
+
+def test_make_update_apply_releases_guard_before_spawn():
+    """REGRESSION: the 1-click update MUST free the single-instance mutex BEFORE
+    spawning the installer. Inno's AppMutex check ABORTS the silent install if the
+    mutex still exists (it does not wait), so spawning while we still held it made
+    the whole update a silent no-op (app exits, nothing installs)."""
+    order = _OrderRecorder()
+    info = object()
+    icon, client, flyout, download, spawn = _apply_fakes(order, info=info)
+    event = threading.Event()
+
+    apply = app.make_update_apply(
+        icon,
+        client,
+        event,
+        flyout,
+        get_update_info=lambda: info,
+        download=download,
+        spawn=spawn,
+        release_guard=lambda: order.events.append("release_guard"),
+        exit_process=lambda c: order.events.append(("exit", c)),
+    )
+    apply()
+
+    # Freed AFTER a verified download, but strictly BEFORE spawn (then quit order,
+    # then the hard process exit so the locked one-file exe can be replaced).
+    assert order.events == [
+        "download",
+        "release_guard",
+        "spawn",
+        "destroy",
+        "disconnect",
+        "stop",
+        ("exit", 0),
+    ]
+
+
+def test_make_update_apply_no_guard_release_on_failure():
+    """release_guard must NOT fire on a download/verify failure (nothing spawned,
+    app stays up) -- we only relinquish single-instance ownership once we are
+    actually about to launch the installer + exit."""
+    order = _OrderRecorder()
+    info = object()
+    icon, client, flyout, download, spawn = _apply_fakes(
+        order, download_raises=True, info=info
+    )
+    event = threading.Event()
+
+    apply = app.make_update_apply(
+        icon,
+        client,
+        event,
+        flyout,
+        get_update_info=lambda: info,
+        download=download,
+        spawn=spawn,
+        release_guard=lambda: order.events.append("release_guard"),
+        exit_process=lambda c: order.events.append(("exit", c)),
+    )
+    apply()
+
+    assert "release_guard" not in order.events
+    assert "spawn" not in order.events
+    assert ("exit", 0) not in order.events  # failed download -> never hard-exit
     assert not event.is_set()
 
 
@@ -1211,6 +1289,9 @@ def test_build_app_apply_update_routes_to_make_update_apply(monkeypatch):
     order = []
     monkeypatch.setattr(app, "download_installer", lambda info: order.append("download") or "C:/Setup.exe")
     monkeypatch.setattr(app, "spawn_installer", lambda path: order.append("spawn"))
+    # Patch the hard-exit seam so the verified-update path doesn't os._exit the test
+    # runner (production: it force-terminates so the installer can swap the locked exe).
+    monkeypatch.setattr(app, "_hard_exit", lambda code=0: order.append(("exit", code)))
     _patch_build_app(monkeypatch)
 
     result = app.build_app("HEADER.eyJ1c2VybmFtZSI6InVfMSJ9.SIG")
@@ -1220,7 +1301,7 @@ def test_build_app_apply_update_routes_to_make_update_apply(monkeypatch):
     result["on_update"]("the-update-info")
     result["api"].apply_update()
 
-    assert order == ["download", "spawn"]
+    assert order == ["download", "spawn", ("exit", 0)]
     # Teardown ran via the shared sequence: the icon was stopped (app exits).
     assert result["icon"].stop_count == 1
     assert result["shutdown_event"].is_set()
@@ -1389,6 +1470,9 @@ def test_main_inverts_threading_tray_detached_and_webview_start(monkeypatch):
         def acquire(self):
             return True
 
+        def release(self):
+            return None
+
     fake_icon = FakeIcon()
     fake_webview = FakeWebview()
     flyout = RecordingFlyout()
@@ -1443,6 +1527,9 @@ def test_main_logged_out_start_sets_neutral_glyph_and_does_not_show_flyout(monke
     class OkGuard:
         def acquire(self):
             return True
+
+        def release(self):
+            return None
 
     fake_icon = FakeIcon()
     fake_webview = FakeWebview()
@@ -2043,10 +2130,15 @@ def test_run_update_check_skipped_version_suppressed():
     assert prefs.saves == 1  # last_check/etag still persisted
 
 
-def test_run_update_check_persists_etag_from_result():
+def test_run_update_check_never_sends_cached_etag():
+    """REGRESSION: a stored ETag must NEVER suppress detection. A 304 ("latest
+    release unchanged since last poll") is not "no update" -- the unchanged release
+    can still be newer than the installed version. run_update_check therefore does
+    a full GET every time (etag=None) and does not persist an etag."""
     ctrl = FakeUpdateController()
     flyout = FakeUpdateFlyout()
-    prefs = FakePrefsModule()
+    # A stale etag is already on disk from a previous poll.
+    prefs = FakePrefsModule({"etag": 'W/"stale"'})
 
     captured = {}
 
@@ -2054,12 +2146,14 @@ def test_run_update_check_persists_etag_from_result():
         captured["etag_in"] = etag
         return _info("2.2.0", etag='W/"fresh"')
 
-    app.run_update_check(
+    info = app.run_update_check(
         ctrl, flyout, check=_check, prefs_module=prefs, current="2.1.0"
     )
 
-    assert captured["etag_in"] is None  # first call, no cached etag
-    assert prefs._prefs["etag"] == 'W/"fresh"'  # fresh etag persisted
+    assert captured["etag_in"] is None  # cached etag is NOT sent -> no spurious 304
+    assert info is not None  # the newer release is still detected
+    assert prefs._prefs.get("etag") in (None, 'W/"stale"')  # not refreshed/relied on
+    assert prefs._prefs["last_check"] is not None  # we still record the check
 
 
 def test_make_update_check_loop_exits_immediately_when_preset():
@@ -2210,6 +2304,38 @@ def test_check_for_update_now_resolves_controller_at_call_time():
         app_mod.run_update_check = orig
 
     assert captured["controller"] is live  # the LIVE controller, not None
+
+
+def test_check_for_update_now_forwards_on_update():
+    """REGRESSION: the manual "Controleer op updates" handler must forward
+    on_update so a manually-discovered update is stashed where 'Nu bijwerken'
+    reads it. Without this, get_update_info() stays None and applying the update
+    fails with "Bijwerken mislukt" even though the banner is showing."""
+    import src.app as app_mod
+
+    captured = {}
+
+    def _fake_run(controller, fl, **kw):
+        captured["on_update"] = kw.get("on_update")
+        return None
+
+    def stash(info):
+        captured["stashed"] = info
+
+    handlers = app.make_update_handlers(
+        lambda: FakeUpdateController(), FakeUpdateFlyout(),
+        prefs_module=FakePrefsModule(), browser=FakeBrowser(),
+        on_update=stash,
+    )
+
+    orig = app_mod.run_update_check
+    try:
+        app_mod.run_update_check = _fake_run
+        handlers["check_for_update_now"]()
+    finally:
+        app_mod.run_update_check = orig
+
+    assert captured["on_update"] is stash  # forwarded to run_update_check
 
 
 def test_make_bridge_handlers_merges_update_handlers_with_get_controller(monkeypatch):

@@ -257,9 +257,15 @@ def spawn_installer(installer_path, *, spawn=subprocess.Popen) -> None:
     The installer is started with the exact silent + relaunch flags the Phase 11
     .iss supports and with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so it
     outlives THIS process. It does NOT wait -- the caller proceeds straight to the
-    locked quit sequence so the app exits; the installer then blocks on
-    AppMutex=Global\\BambuLabSystray_singleton (single_instance.MUTEX_NAME) until
-    the app is gone, swaps the exe, and relaunches it non-elevated.
+    locked quit sequence so the app exits.
+
+    IMPORTANT (the load-bearing ordering, see make_update_apply): the caller MUST
+    have already freed the single-instance mutex (single_instance.release) BEFORE
+    calling this. Inno's AppMutex=Global\\BambuLabSystray_singleton check ABORTS the
+    silent install if the mutex still exists -- it does NOT block/wait for it to
+    clear (a long-standing misconception). With the mutex freed, the installer's
+    CloseApplications/RestartApplications (Restart Manager) close+relaunch the app
+    to swap the exe non-elevated.
 
     ``spawn`` is injectable (default subprocess.Popen) so tests assert the exact
     args + creationflags with a recorder -- no real process is launched.

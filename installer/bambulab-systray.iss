@@ -5,7 +5,7 @@
 ; `iscc bambulab-systray.iss` work and is NOT a second authoritative literal (D-02).
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.0"
+  #define MyAppVersion "2.1.2"
 #endif
 
 #define MyAppName "Bambu Lab Systray"
@@ -24,9 +24,11 @@ PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\Bambu Lab Systray
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-; Silent self-update support: wait on the EXACT existing app mutex so the running app
-; exits before files are replaced (D-12). CloseApplications/RestartApplications let the
-; restart manager close+reopen the app under the silent flags (D-13).
+; Silent self-update support. NOTE: AppMutex does NOT make Setup *wait* for the app to
+; exit -- if the mutex exists at startup, silent Setup ABORTS (no-op update). So the app
+; FREES this mutex (single_instance.release) BEFORE spawning the installer; see
+; make_update_apply. The actual close+reopen for the exe swap is done by the Restart
+; Manager via CloseApplications/RestartApplications under the silent flags (D-12/D-13).
 AppMutex=Global\BambuLabSystray_singleton
 CloseApplications=yes
 RestartApplications=yes

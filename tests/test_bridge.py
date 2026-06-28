@@ -138,7 +138,7 @@ def test_serialize_state_carries_static_version():
     # present on the serialized state so the panel paints it on first load (D-10).
     out = serialize_state(_running_state(), ConnectionStatus.CONNECTED, logged_in=True)
     assert out["version"] == __version__
-    assert out["version"] == "2.1.0"
+    assert out["version"] == "2.1.2"
     assert out["version"]  # not empty
 
 

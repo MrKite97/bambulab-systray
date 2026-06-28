@@ -27,12 +27,17 @@ class FakeKernel32:
         self.existing = existing
         self.handle = handle
         self.create_calls = []
+        self.close_calls = []
         self._last_error = 0
 
     def CreateMutexW(self, attrs, initial_owner, name):
         self.create_calls.append(name)
         self._last_error = single_instance.ERROR_ALREADY_EXISTS if self.existing else 0
         return self.handle
+
+    def CloseHandle(self, handle):
+        self.close_calls.append(handle)
+        return True
 
     def GetLastError(self):
         return self._last_error
@@ -91,6 +96,53 @@ def test_already_running_false_when_fresh(monkeypatch):
 def test_mutex_name_is_stable_and_app_scoped():
     assert "BambuLabSystray" in single_instance.MUTEX_NAME
     assert single_instance.ERROR_ALREADY_EXISTS == 183
+
+
+def test_release_closes_handle_and_clears_it(monkeypatch):
+    """release() frees the named mutex (CloseHandle) so the self-update installer's
+    AppMutex check passes -- and clears the handle so a re-release is a no-op."""
+    fake = FakeKernel32(existing=False)
+    monkeypatch.setattr(single_instance, "_kernel32", lambda: fake)
+
+    guard = single_instance.InstanceGuard()
+    guard.acquire()
+    guard.release()
+
+    assert fake.close_calls == [fake.handle]  # the owned handle was closed
+    assert guard._handle is None  # cleared so the mutex name is relinquished
+
+
+def test_release_is_idempotent_and_safe_before_acquire(monkeypatch):
+    """Calling release() twice, or before acquire(), must be a harmless no-op
+    (CloseHandle is invoked at most once for the owned handle)."""
+    fake = FakeKernel32(existing=False)
+    monkeypatch.setattr(single_instance, "_kernel32", lambda: fake)
+
+    guard = single_instance.InstanceGuard()
+    guard.release()  # before acquire: no handle -> no CloseHandle
+    assert fake.close_calls == []
+
+    guard.acquire()
+    guard.release()
+    guard.release()  # second release: already cleared -> still one CloseHandle
+    assert fake.close_calls == [fake.handle]
+
+
+def test_release_never_raises(monkeypatch):
+    """release() runs inside the update teardown -- a CloseHandle failure must be
+    swallowed, never raised."""
+
+    class BrokenClose(FakeKernel32):
+        def CloseHandle(self, handle):
+            raise OSError("CloseHandle failed")
+
+    fake = BrokenClose(existing=False)
+    monkeypatch.setattr(single_instance, "_kernel32", lambda: fake)
+
+    guard = single_instance.InstanceGuard()
+    guard.acquire()
+    guard.release()  # must not raise
+    assert guard._handle is None
 
 
 def test_acquire_tolerates_create_failure(monkeypatch):

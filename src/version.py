@@ -13,7 +13,7 @@ from packaging.version import Version, parse as _parse
 
 # The ONE version literal. PEP 440 / semver, NO leading "v"
 # (the "v" prefix is a git-tag/Release convention only -- D-02).
-__version__ = "2.1.0"
+__version__ = "2.1.2"
 
 
 def parse_version(value: str | None = None) -> Version:

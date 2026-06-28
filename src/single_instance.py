@@ -49,6 +49,25 @@ class InstanceGuard:
     def __init__(self):
         self._handle = None
 
+    def release(self) -> None:
+        """Free the named mutex by closing the owned handle (idempotent; never raises).
+
+        Used by the 1-click self-update path (:func:`make_update_apply`): the silent
+        Inno installer checks ``AppMutex=Global\\BambuLabSystray_singleton`` at startup
+        and ABORTS (it does NOT wait/block) if the mutex still exists. So the app must
+        free the mutex BEFORE it spawns the installer; ``CloseApplications`` /
+        ``RestartApplications`` in the .iss then close+relaunch the app for the exe
+        swap. Calling this twice (or before acquire) is a safe no-op.
+        """
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            _kernel32().CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - releasing must never raise into teardown
+            logger.debug("single-instance release failed; ignoring")
+
     def acquire(self) -> bool:
         """Try to become the single instance.
 

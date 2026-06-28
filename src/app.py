@@ -36,8 +36,11 @@ username / Authorization header are NEVER logged. Only ``gcode_state`` /
 """
 
 import argparse
+import ctypes
 import json
 import logging
+import os
+import sys
 import threading
 import time
 import webbrowser
@@ -354,6 +357,39 @@ def _run_quit_sequence(icon, client, shutdown_event, *, flyout=None):
     icon.stop()  # disposes the tray icon (NO orphan); always reached
 
 
+def _terminate_pid(pid: int, code: int = 0) -> None:
+    """Best-effort force-terminate another process by PID (Win32; never raises)."""
+    try:
+        k = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_TERMINATE = 0x0001
+        handle = k.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if handle:
+            k.TerminateProcess(handle, code)
+            k.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - terminating must never raise into teardown
+        logger.debug("terminate pid %s failed; ignoring", pid)
+
+
+def _hard_exit(code: int = 0) -> None:
+    """Force-terminate the app's WHOLE process tree for the self-update exe swap.
+
+    The 1-click update spawns the installer, which must REPLACE this running exe. But
+    PyInstaller one-file runs Python in a CHILD process while the PARENT bootloader is
+    a SECOND copy of the same exe -- and BOTH keep {app}\\bambulab-systray.exe LOCKED.
+    The parent can also hang in post-exit cleanup. os._exit kills only THIS (child)
+    process, leaving the parent bootloader holding the lock, so the installer can't
+    overwrite the exe and the update silently stalls. So under a frozen build we FIRST
+    terminate the parent bootloader, THEN os._exit ourselves -> every handle to the
+    exe drops and CloseApplications/RestartApplications can swap it and relaunch us.
+
+    Guarded by ``sys.frozen`` so a dev/source run only os._exit's (no parent to kill).
+    A module seam (not an inline os._exit) so the test suite patches it and never exits.
+    """
+    if getattr(sys, "frozen", False):  # only under the packaged one-file build
+        _terminate_pid(os.getppid(), code)
+    os._exit(code)
+
+
 def make_quit_handler(client, shutdown_event, *, flyout=None):
     """Build the 'Afsluiten' menu callback that tears down the GUI + both threads.
 
@@ -392,6 +428,8 @@ def make_update_apply(
     get_update_info,
     download=download_installer,
     spawn=spawn_installer,
+    release_guard=None,
+    exit_process=None,
 ):
     """Build the 'Nu bijwerken' handler: download -> verify -> spawn -> teardown (D-06/D-07).
 
@@ -423,11 +461,26 @@ def make_update_apply(
             logger.debug("update download/verify failed; surfacing error, staying up")
             _push_update_failed(flyout)
             return None
-        # Verified: start the detached installer FIRST (it waits on AppMutex), THEN
-        # run the exact locked quit order so we exit and let it proceed.
+        # Free the single-instance mutex BEFORE launching the installer. The silent
+        # Inno installer checks AppMutex=Global\\BambuLabSystray_singleton at startup
+        # and ABORTS (it does NOT wait) if the mutex still exists -- so spawning while
+        # we still hold it made the whole update a silent no-op (app exits, nothing
+        # installs). With the mutex freed first, the installer proceeds and the .iss's
+        # CloseApplications/RestartApplications close+relaunch us for the exe swap.
+        if release_guard is not None:
+            try:
+                release_guard()
+            except Exception:  # noqa: BLE001 - never block the update on this
+                logger.debug("release_guard() raised; continuing to spawn")
+        # Verified + mutex freed: start the detached installer FIRST, THEN run the
+        # exact locked quit order so we exit and let the installer proceed.
         spawn(path)
         _run_quit_sequence(icon, client, shutdown_event, flyout=flyout)
-        return None
+        # HARD-exit so the one-file bootloader can't linger holding the exe LOCKED
+        # (graceful return leaves it mapped -> the installer can't overwrite it and
+        # the update stalls). See _hard_exit. Injectable so tests never really exit.
+        (exit_process or _hard_exit)(0)
+        return None  # only reached when a test injects a non-exiting fake
 
     return _apply
 
@@ -588,11 +641,17 @@ def run_update_check(
     prefs = prefs_module.load_update_prefs()
     if not force and not prefs.get("auto_update_enabled", True):
         return None
-    info = check(current=current or __version__, etag=prefs.get("etag"))
-    # Always record we checked; capture a fresh etag when present.
+    # Deliberately DO NOT send a cached ETag here. A 304 ("the latest-release
+    # resource is unchanged since our last poll") is NOT the same as "there is no
+    # update": that unchanged latest release can still be NEWER than the INSTALLED
+    # version. Sending If-None-Match made check() return None on every poll after
+    # the first detection, so the banner vanished on restart, 'Nu bijwerken' lost
+    # the stashed info, and the manual "Controleer op updates" wrongly reported
+    # "Je gebruikt de nieuwste versie". The check runs ~once/day + on manual click,
+    # far under GitHub's rate limit, so a full GET each time is the correct trade.
+    info = check(current=current or __version__, etag=None)
+    # Always record we checked.
     prefs["last_check"] = _utc_now_iso()
-    if info is not None and getattr(info, "etag", None):
-        prefs["etag"] = info.etag
     if info is None:
         prefs_module.save_update_prefs(prefs)  # soft-fail: last_check only, no notify
         return None
@@ -671,6 +730,7 @@ def make_update_handlers(
     *,
     prefs_module=update_prefs_module,
     browser=webbrowser,
+    on_update=None,
 ):
     """Build the five update bridge handlers (D-10). All collaborators injectable.
 
@@ -716,7 +776,8 @@ def make_update_handlers(
         # "Je gebruikt de nieuwste versie" status -- NO pop-up.
         controller = get_controller()
         info = run_update_check(
-            controller, flyout, force=True, prefs_module=prefs_module
+            controller, flyout, force=True, prefs_module=prefs_module,
+            on_update=on_update,
         )
         if info is None:
             try:
@@ -849,7 +910,13 @@ def make_session(
 
 
 def make_bridge_handlers(
-    flyout, session, *, start_mqtt=None, get_controller=None, apply_update=None
+    flyout,
+    session,
+    *,
+    start_mqtt=None,
+    get_controller=None,
+    apply_update=None,
+    on_update=None,
 ):
     """Build the js_api handler mapping wiring the panel to the SessionController.
 
@@ -880,7 +947,9 @@ def make_bridge_handlers(
     # late-bind accessor so check_for_update_now resolves the LIVE controller at
     # call time (the controller does not exist when these handlers are built).
     if get_controller is not None:
-        handlers.update(make_update_handlers(get_controller, flyout))
+        handlers.update(
+            make_update_handlers(get_controller, flyout, on_update=on_update)
+        )
     # Phase 14 (D-08): the 'Nu bijwerken' handler is built AFTER the icon exists,
     # so build_gui passes a late-bind accessor (``apply_update``) here; when None
     # (the bare call) the handler is a safe no-op until a session/icon exists.
@@ -1189,6 +1258,7 @@ def build_gui(
     webview=None,
     connect=None,
     sleep=None,
+    release_guard=None,
 ):
     """Compose the GUI/bridge/menu/controller WITHOUT a token (Plan 08-02).
 
@@ -1217,6 +1287,14 @@ def build_gui(
     # "apply_update" before the icon/controller are constructed.
     _update_holder = {"info": None}  # latest actionable UpdateInfo
     _apply_holder = {"fn": None}  # make_update_apply callback (filled after icon)
+
+    def _stash_update_info(info):
+        # The single setter that stashes the LATEST actionable UpdateInfo where
+        # 'Nu bijwerken' reads it. Wired to BOTH the background update-check daemon
+        # AND the manual "Controleer op updates" handler so a manually-discovered
+        # update can be applied immediately (without it, get_update_info() stays
+        # None and 'Nu bijwerken' fails with "Bijwerken mislukt").
+        _update_holder["info"] = info
 
     def _state_provider():
         # The page seed (get_initial_state) opens LOGGED-OUT on start; the
@@ -1297,6 +1375,10 @@ def build_gui(
             # Phase 14 (D-08): "Nu bijwerken" routes through the no-op-safe late
             # router; the real make_update_apply callback is filled below.
             apply_update=_apply_update_router,
+            # Phase 14 (D-08): the manual "Controleer op updates" handler stashes
+            # any update it finds so 'Nu bijwerken' can read it (same setter the
+            # background daemon uses).
+            on_update=_stash_update_info,
         ),
         state_provider=_state_provider,
     )
@@ -1382,6 +1464,7 @@ def build_gui(
         get_update_info=lambda: _update_holder["info"],
         download=download_installer,
         spawn=spawn_installer,
+        release_guard=release_guard,
     )
 
     return {
@@ -1397,8 +1480,9 @@ def build_gui(
         "stop_session": stop_session,
         "relogin_handler": relogin_handler,
         # Phase 14 (D-08): the setter the update-check loop calls so the latest
-        # actionable UpdateInfo is stashed where 'Nu bijwerken' reads it.
-        "on_update": lambda info: _update_holder.__setitem__("info", info),
+        # actionable UpdateInfo is stashed where 'Nu bijwerken' reads it. Shared
+        # with the manual "Controleer op updates" handler (see _stash_update_info).
+        "on_update": _stash_update_info,
     }
 
 
@@ -1607,7 +1691,10 @@ def main(argv=None, *, guard=None, webview=None) -> int:
 
     # Build the token-less GUI/bridge/menu + the real SessionController-backed
     # handlers and deferred MQTT hooks. NO token is required to construct this.
-    gui = build_gui(webview=webview)
+    # Pass guard.release so the 1-click self-update can free the single-instance
+    # mutex BEFORE spawning the installer (else its AppMutex check aborts the silent
+    # install -- see make_update_apply / single_instance.release).
+    gui = build_gui(webview=webview, release_guard=guard.release)
     icon = gui["icon"]
     controller = gui["controller"]
     shutdown_event = gui["shutdown_event"]
