@@ -64,7 +64,7 @@ def test_files_source_is_onefile_exe():
 def test_version_single_sourced():
     text = _iss_text()
     assert "#ifndef MyAppVersion" in text
-    assert '#define MyAppVersion "2.1.2"' in text
+    assert '#define MyAppVersion "2.1.3"' in text
 
 
 def test_no_login_state_or_hklm_reference():

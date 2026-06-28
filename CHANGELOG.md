@@ -4,6 +4,11 @@ All notable changes to Bambu Lab Systray are documented here. Versions follow
 [semantic versioning](https://semver.org/); the version comes from the git tag
 (`v*`) and is the single source of truth (`src/version.py`).
 
+## v2.1.3
+
+- Test release to confirm the fixed 1-click self-update works from a build that
+  contains the v2.1.2 updater fixes. No functional changes.
+
 ## v2.1.2
 
 Fixes four bugs that broke the auto-update path end-to-end (found during the

@@ -5,7 +5,7 @@
 ; `iscc bambulab-systray.iss` work and is NOT a second authoritative literal (D-02).
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.2"
+  #define MyAppVersion "2.1.3"
 #endif
 
 #define MyAppName "Bambu Lab Systray"
